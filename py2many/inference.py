@@ -263,8 +263,13 @@ class InferTypesTransformer(ast.NodeTransformer):
         return node
 
     @staticmethod
+    def _sanitize_for_python_annotation(typename: str) -> str:
+        return typename.replace("&'static str", "str").replace("&str", "str")
+
+    @staticmethod
     def _annotate(node, typename: str):
         # ast.parse produces a Module object that needs to be destructured
+        typename = InferTypesTransformer._sanitize_for_python_annotation(typename)
         type_annotation = cast(ast.Expr, create_ast_node(typename, node)).value
         node.annotation = type_annotation
 

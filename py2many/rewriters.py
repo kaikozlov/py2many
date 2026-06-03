@@ -88,17 +88,21 @@ class ComplexDestructuringRewriter(ast.NodeTransformer):
         if self._disable:
             return node
         target = node.targets[0]
-        if isinstance(target, ast.Tuple) and not (isinstance(target.elts[0], ast.Name)):
+        if isinstance(target, ast.Tuple) and any(
+            not isinstance(elt, ast.Name) for elt in target.elts
+        ):
             temps = []
             orig = [None] * len(target.elts)
-            body = [node]
+            body = []
             for i in range(len(target.elts)):
                 temps.append(ast.Name(id=self._get_temp(), lineno=node.lineno))
-                # The irony!
                 target.elts[i], orig[i] = temps[i], target.elts[i]
-                body.append(
-                    ast.Assign(targets=[orig[i]], value=temps[i], lineno=node.lineno)
+            body.append(node)
+            for i in range(len(target.elts)):
+                inner = ast.Assign(
+                    targets=[orig[i]], value=temps[i], lineno=node.lineno
                 )
+                body.append(self.visit_Assign(inner))
             return create_ast_block(body=body, at_node=node)
         return node
 

@@ -726,6 +726,63 @@ def make(data):
     assert "BytesIO::from_bytes(data)" in generated
 
 
+def test_division_with_deref_operand_does_not_open_block_comment():
+    generated = rust_transpile("""
+def scale(size, dpi):
+    return size / dpi
+""")
+
+    assert ") / (" in generated
+    assert ")/*" not in generated
+
+
+def test_attribute_tuple_unpack_rewrites_to_valid_rust():
+    generated = rust_transpile("""
+class Book:
+    def load(self, viewports_by_count):
+        (self.original_width, self.original_height), best_count = viewports_by_count[0]
+        return best_count
+""")
+
+    assert "let (self.original_width, self.original_height)" not in generated
+    assert "self.original_width = " in generated
+    assert "self.original_height = " in generated
+
+
+def test_forward_class_reference_emits_constructor_call():
+    generated = rust_transpile("""
+class Outer:
+    def build(self):
+        return ImgPlane(self, False)
+
+class ImgPlane:
+    def __init__(self, parent, alpha):
+        self.parent = parent
+""")
+
+    assert "ImgPlane(self, false)" in generated
+    assert "ImgPlane{" not in generated
+
+
+def test_negative_subscript_assignment_emits_helper():
+    generated = rust_transpile("""
+def trim(items):
+    items[-2] = "x"
+""")
+
+    assert "python_index_assign(&mut items, -2" in generated
+
+
+def test_dict_with_str_values_does_not_break_inference():
+    generated = rust_transpile("""
+def make():
+    return {"key": "value", "other": "data"}
+""")
+
+    assert "FAILED" not in generated
+    assert "HashMap" in generated or "vec!" in generated or "{" in generated
+
+
 def test_zipfile_emits_helper_placeholder():
     generated = rust_transpile("""
 import zipfile

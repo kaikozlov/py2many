@@ -431,10 +431,12 @@ class RustTranspiler(CLikeTranspiler):
             vargs += [self.visit(kw.value) for kw in node.keywords]
 
         if isinstance(fndef, ast.ClassDef):
-            if fname in CONSTRUCTOR_TYPES or any(
+            has_new = any(
                 isinstance(body_item, ast.FunctionDef) and body_item.name == "__new__"
                 for body_item in fndef.body
-            ):
+            )
+            has_decls = hasattr(fndef, "declarations")
+            if fname in CONSTRUCTOR_TYPES or has_new or not has_decls:
                 return f"{fname}({', '.join(vargs)})"
             return self._visit_struct_literal(node, fname, fndef)
 
@@ -1124,6 +1126,22 @@ class RustTranspiler(CLikeTranspiler):
         return f"{value_str} as {cast_to}"
 
     def visit_AugAssign(self, node) -> str:
+        if isinstance(node.target, ast.Subscript) and self._slice_bound_is_negative(
+            node.target.slice
+        ):
+            container = self.visit(node.target.value)
+            index = self.visit(node.target.slice)
+            op = self.visit(node.op)
+            value = self.visit(node.value)
+            self._usings.add("pylib::python_index_assign")
+            current = f"python_index({container}, {index})"
+            if op == "+=":
+                updated = f"{current} + {value}"
+            elif op == "-=":
+                updated = f"{current} - {value}"
+            else:
+                updated = f"{current} {op} {value}"
+            return f"python_index_assign(&mut {container}, {index}, {updated});"
         target = node.target
         target_str = self.visit(node.target)
         op = self.visit(node.op)
@@ -1137,6 +1155,19 @@ class RustTranspiler(CLikeTranspiler):
             )
         return f"{target_str} {op}= {value};"
 
+    def _visit_subscript_assign(self, node, target: ast.Subscript, value: str) -> str:
+        container = self.visit(target.value)
+        if self._slice_bound_is_negative(target.slice):
+            index = self.visit(target.slice)
+            self._usings.add("pylib::python_index_assign")
+            assignment = f"python_index_assign(&mut {container}, {index}, {value});"
+        else:
+            target_str = self.visit(target)
+            assignment = f"{target_str} = {value};"
+        if is_global(node):
+            return f"pub fn __module_init_{node.lineno}() {{\n{assignment}\n}}"
+        return assignment
+
     def _visit_AssignOne(self, node, target) -> str:
         kw = self._compute_kw(node, target)
 
@@ -1147,12 +1178,17 @@ class RustTranspiler(CLikeTranspiler):
                 value = self.visit(node.value)
                 return f"{target_id} = {value};"
 
-        if isinstance(target, ast.Subscript) or isinstance(target, ast.Attribute):
-            target = self.visit(target)
+        if isinstance(target, ast.Subscript):
             value = self.visit(node.value)
             if value is None:
                 value = "None"
-            assignment = f"{target} = {value};"
+            return self._visit_subscript_assign(node, target, value)
+        if isinstance(target, ast.Attribute):
+            target_str = self.visit(target)
+            value = self.visit(node.value)
+            if value is None:
+                value = "None"
+            assignment = f"{target_str} = {value};"
             if is_global(node):
                 return f"pub fn __module_init_{node.lineno}() {{\n{assignment}\n}}"
             return assignment
@@ -1161,9 +1197,11 @@ class RustTranspiler(CLikeTranspiler):
         if definition is None:
             definition = node.scopes.find(get_id(target))
         if isinstance(target, ast.Name) and defined_before(definition, node):
-            needs_cast = self._needs_cast(target, node.value)
             target_str = self.visit(target)
             value = self.visit(node.value)
+            if self._is_module_level(node):
+                return ""
+            needs_cast = self._needs_cast(target, node.value)
             if needs_cast:
                 target_type = self._typename_from_annotation(target)
                 value = self._assign_cast(

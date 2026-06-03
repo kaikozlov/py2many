@@ -176,9 +176,11 @@ class CLikeTranspiler(CommonCLikeTranspiler):
             left = f"({left} as {left_target_type})"
 
         # Multiplication and division binds tighter (has higher precedence) than addition and subtraction.
-        # To visually communicate this we omit spaces when multiplying and dividing.
-        if isinstance(node.op, (ast.Mult, ast.Div)):
-            return f"({left}{op}{right})"
+        # Division always uses spaced `/` so `/ *` is not parsed as a block comment opener.
+        if isinstance(node.op, ast.Mult):
+            return f"({left}*{right})"
+        if isinstance(node.op, ast.Div):
+            return f"({left}) / ({right})"
         else:
             return f"({left} {op} {right})"
 
