@@ -234,7 +234,7 @@ class FStringJoinRewriter(ast.NodeTransformer):
     def visit_JoinedStr(self, node):
         # mojo fstrings will be implemented at some point
         # https://github.com/modularml/mojo/issues/398
-        if self._language in {"mojo", "python", "v"}:
+        if self._language in {"mojo", "python", "rust", "v"}:
             return node
         new_node = cast(ast.Expr, create_ast_node('"".join([])', node)).value
         new_node = cast(ast.Call, new_node)
@@ -319,14 +319,12 @@ class PrintBoolRewriter(ast.NodeTransformer):
     # Go can't handle IfExpr in print. Handle it differently here
     def _do_go_rewrite(self, node) -> ast.AST:
         if_stmt = create_ast_node(
-            textwrap.dedent(
-                """\
+            textwrap.dedent("""\
             if True:
                 print('True')
             else:
                 print('False')
-        """
-            ),
+        """),
             node,
         )
         if_stmt = cast(ast.If, if_stmt)

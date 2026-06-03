@@ -1,7 +1,7 @@
 import ast
 import textwrap
 from pathlib import Path
-from typing import List, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 from py2many.analysis import (
     FunctionTransformer,
@@ -114,9 +114,7 @@ class RustTranspiler(CLikeTranspiler):
         # This should not contain lints which mask possibly erroneous semantics, e.g. float_cmp
         # Those, and lints triggered by explicitly bad test logic, belong in
         # .github/workflows/clippy.yml
-        lint_ignores = (
-            textwrap.dedent(
-                """
+        lint_ignores = textwrap.dedent("""
         #![allow(clippy::assertions_on_constants)]
         #![allow(clippy::bool_comparison)]
         #![allow(clippy::collapsible_else_if)]
@@ -140,11 +138,7 @@ class RustTranspiler(CLikeTranspiler):
         #![allow(unused_imports)]
         #![allow(unused_mut)]
         #![allow(unused_parens)]
-        """
-            )
-            if not self._no_prologue
-            else ""
-        )
+        """) if not self._no_prologue else ""
         lint_ignores += "\n".join(f"#![allow({allow})]" for allow in self._allows)
         cargo_toml = f"""\
         //! ```cargo
@@ -173,16 +167,14 @@ class RustTranspiler(CLikeTranspiler):
                 funcs.append(f"m.add_function(wrap_pyfunction!({fname}, m)?)?;")
             funcs_str = "\n".join(funcs)
             module_name = Path(tree.__file__).stem
-            return textwrap.dedent(
-                f"""\
+            return textwrap.dedent(f"""\
             #[pymodule]
             fn {module_name}(_py: Python, m: &PyModule) -> PyResult<()> {{
                 {funcs_str}
 
                 Ok(())
             }}
-            """
-            )
+            """)
         return ""
 
     def visit_Expr(self, node) -> str:
@@ -191,6 +183,7 @@ class RustTranspiler(CLikeTranspiler):
         return super().visit_Expr(node)
 
     def visit_FunctionDef(self, node, async_prefix="") -> str:
+        is_constructor = node.name == "__init__"
         body = "\n".join([self.visit(n) for n in node.body])
         typenames, args = self.visit(node.args)
 
@@ -198,7 +191,8 @@ class RustTranspiler(CLikeTranspiler):
         if args and args[0] == "self":
             del typenames[0]
             del args[0]
-            args_list.append("&self")
+            if not is_constructor:
+                args_list.append("&self")
 
         is_python_main = getattr(node, "python_main", False)
         if is_python_main:
@@ -217,7 +211,9 @@ class RustTranspiler(CLikeTranspiler):
             args_list.append(f"{arg}: {typename}")
 
         return_type = "" if not is_python_main else "-> Result<()>"
-        if node.returns:
+        if is_constructor:
+            return_type = "-> Self"
+        elif node.returns:
             typename = self._typename_from_annotation(node, attr="returns")
             if getattr(node.returns, "rust_needs_reference", False):
                 typename = f"&{typename}"
@@ -240,9 +236,14 @@ class RustTranspiler(CLikeTranspiler):
         if len(typedecls) > 0:
             template = "<{}>".format(", ".join(typedecls))
 
+        if is_constructor:
+            body = body.replace("self.", "__self.").replace("(self,", "(&mut __self,")
+            body = "let mut __self = Self::default();\n" + body + "\n__self"
+
         extension = "#[pyfunction]\n" if self.extension else ""
         args_list = ", ".join(args_list)
-        funcdef = f"{extension}pub {async_prefix}fn {node.name}{template}({args_list}) {return_type}"
+        fn_name = "new" if is_constructor else node.name
+        funcdef = f"{extension}pub {async_prefix}fn {fn_name}{template}({args_list}) {return_type}"
         return_success = (
             "Ok(())" if is_python_main else ""
         )  # TODO: generalize this to functions that return Result<T, E>
@@ -306,6 +307,8 @@ class RustTranspiler(CLikeTranspiler):
 
     def visit_Attribute(self, node) -> str:
         attr = node.attr
+        if attr == "__init__":
+            attr = "new"
         if attr in self._keywords:
             attr = attr + "_"
 
@@ -366,6 +369,19 @@ class RustTranspiler(CLikeTranspiler):
         fname = self.visit(node.func)
         fndef = node.scopes.find(fname)
 
+        if (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr == "format"
+            and isinstance(node.func.value, ast.Constant)
+            and isinstance(node.func.value.value, str)
+        ):
+            fmt = self._python_format_method_to_rust(node.func.value.value)
+            args = [self.visit(a) for a in node.args]
+            fmt_literal = self._rust_string_literal(fmt)
+            if args:
+                return f"format!({fmt_literal}, {', '.join(args)})"
+            return f"format!({fmt_literal})"
+
         if isinstance(fndef, ast.ClassDef):
             return self._visit_struct_literal(node, fname, fndef)
 
@@ -374,6 +390,17 @@ class RustTranspiler(CLikeTranspiler):
             vargs += [self.visit(a) for a in node.args]
         if node.keywords:
             vargs += [self.visit(kw.value) for kw in node.keywords]
+
+        if fname == "isinstance" and len(vargs) >= 2:
+            return f"is_instance::<{vargs[1]}>(&{vargs[0]})"
+        if fname == "hasattr" and len(vargs) >= 2:
+            return f"has_attr(&{vargs[0]}, {vargs[1]})"
+        if fname in {"re.match_", "re::match_"} and len(vargs) >= 2:
+            self._usings.add("regex::Regex")
+            return f"Regex::new({vargs[0]}).unwrap().is_match(&{vargs[1]})"
+        if fname in {"re.split", "re::split"} and len(vargs) >= 2:
+            self._usings.add("regex::Regex")
+            return f"Regex::new({vargs[0]}).unwrap().split(&{vargs[1]}).collect::<Vec<_>>()"
 
         ret = self._dispatch(node, fname, vargs)
         node_result_type = getattr(node, "result_type", False)
@@ -518,7 +545,129 @@ class RustTranspiler(CLikeTranspiler):
         else:
             return super().visit_UnaryOp(node)
 
+    @staticmethod
+    def _rust_string_literal(value: str) -> str:
+        escaped = (
+            value.replace("\\", "\\\\")
+            .replace('"', '\\"')
+            .replace("\n", "\\n")
+            .replace("\r", "\\r")
+            .replace("\t", "\\t")
+        )
+        return f'"{escaped}"'
+
+    @staticmethod
+    def _rust_format_placeholder(conversion: str) -> str:
+        if conversion == "r":
+            return "{:?}"
+        if conversion == "x":
+            return "{:x}"
+        if conversion == "X":
+            return "{:X}"
+        if conversion == "o":
+            return "{:o}"
+        if conversion == "e":
+            return "{:e}"
+        if conversion == "E":
+            return "{:E}"
+        return "{}"
+
+    @classmethod
+    def _python_percent_format_to_rust(cls, value: str) -> Optional[str]:
+        buf = []
+        index = 0
+        conversions = "diouxXeEfFgGcrsa"
+        while index < len(value):
+            char = value[index]
+            if char == "{":
+                buf.append("{{")
+                index += 1
+                continue
+            if char == "}":
+                buf.append("}}")
+                index += 1
+                continue
+            if char != "%":
+                buf.append(char)
+                index += 1
+                continue
+
+            if index + 1 < len(value) and value[index + 1] == "%":
+                buf.append("%")
+                index += 2
+                continue
+
+            spec_index = index + 1
+            if spec_index < len(value) and value[spec_index] == "(":
+                end_mapping = value.find(")", spec_index + 1)
+                if end_mapping == -1:
+                    return None
+                spec_index = end_mapping + 1
+
+            while spec_index < len(value) and value[spec_index] not in conversions:
+                spec_index += 1
+
+            if spec_index >= len(value):
+                return None
+
+            buf.append(cls._rust_format_placeholder(value[spec_index]))
+            index = spec_index + 1
+
+        return "".join(buf)
+
+    def _visit_percent_string_format(self, node) -> Optional[str]:
+        if not (
+            isinstance(node.op, ast.Mod)
+            and isinstance(node.left, ast.Constant)
+            and isinstance(node.left.value, str)
+        ):
+            return None
+
+        fmt = self._python_percent_format_to_rust(node.left.value)
+        if fmt is None:
+            return None
+
+        if isinstance(node.right, ast.Tuple):
+            args = [self.visit(elt) for elt in node.right.elts]
+        else:
+            args = [self.visit(node.right)]
+
+        fmt_literal = self._rust_string_literal(fmt)
+        if args:
+            return f"format!({fmt_literal}, {', '.join(args)})"
+        return f"format!({fmt_literal})"
+
+    @staticmethod
+    def _escape_rust_format_text(value: str) -> str:
+        return value.replace("{", "{{").replace("}", "}}")
+
+    @staticmethod
+    def _python_format_method_to_rust(value: str) -> str:
+        # Keep this conservative: py2many's current Rust target mostly needs to
+        # remove Python .format(...) syntax. Width/grouping details can be refined
+        # later once the runtime types are known.
+        return value.replace("{:,}", "{}").replace("{:n}", "{}")
+
+    def visit_JoinedStr(self, node) -> str:
+        fmt_parts = []
+        args = []
+        for value in node.values:
+            if isinstance(value, ast.Constant):
+                fmt_parts.append(self._escape_rust_format_text(value.value))
+            elif isinstance(value, ast.FormattedValue):
+                fmt_parts.append("{:?}" if value.conversion == ord("r") else "{}")
+                args.append(self.visit(value.value))
+
+        fmt_literal = self._rust_string_literal("".join(fmt_parts))
+        if args:
+            return f"format!({fmt_literal}, {', '.join(args)})"
+        return f"format!({fmt_literal})"
+
     def visit_BinOp(self, node) -> str:
+        percent_format = self._visit_percent_string_format(node)
+        if percent_format is not None:
+            return percent_format
+
         if (
             isinstance(node.left, ast.List)
             and isinstance(node.op, ast.Mult)
@@ -547,23 +696,19 @@ class RustTranspiler(CLikeTranspiler):
             else:
                 typename, _ = typename
                 variants.append(f"{member_id}({typename}),")
-            tag_check = textwrap.dedent(
-                f"""
+            tag_check = textwrap.dedent(f"""
                     fn is_{lower_member_id}(&self) -> bool {{
                         matches!(*self, {camel_node_name}::{camel_member_id}(_))
-                    }}"""
-            )
+                    }}""")
             tag_checkers.append(tag_check)
-            accessor = textwrap.dedent(
-                f"""
+            accessor = textwrap.dedent(f"""
                     fn {lower_member_id}(&self) -> Option<&{typename}>{{
                         if let {camel_node_name}::{camel_member_id}(val) = self {{
                             Some(val)
                         }} else {{
                             None
                         }}
-                    }}"""
-            )
+                    }}""")
             accessors.append(accessor)
         body_str = "\n".join(variants)
         impl_str = "\n".join(accessors) + "\n" + "\n".join(tag_checkers)
@@ -596,8 +741,8 @@ class RustTranspiler(CLikeTranspiler):
         fields = []
         index = 0
         for declaration, typename in declarations.items():
-            if typename is None:
-                typename = f"ST{index}"
+            if typename is None or typename == self._default_type:
+                typename = "TODO_py2many_unknown"
                 index += 1
             fields.append(f"pub {declaration}: {typename},")
 
@@ -606,7 +751,7 @@ class RustTranspiler(CLikeTranspiler):
                 b.self_type = node.name
 
         extension = "#[pyclass]\n" if self.extension else ""
-        struct_def = "pub struct {0} {{\n{1}\n}}\n\n".format(
+        struct_def = "#[derive(Default)]\npub struct {0} {{\n{1}\n}}\n\n".format(
             node.name, "\n".join(fields)
         )
         impl_extension = "#[pymethods]\n" if self.extension else ""
@@ -663,6 +808,9 @@ class RustTranspiler(CLikeTranspiler):
         return self._rust_module_path(module_name).split("::", 1)[0]
 
     def _import(self, name: str) -> str:
+        if name == "re":
+            self._usings.add("regex::Regex")
+            return ""
         if name not in self._rust_ignored_module_set:
             self._usings.add(self._rust_module_path(name))
         return ""
@@ -911,6 +1059,8 @@ class RustTranspiler(CLikeTranspiler):
                 value = f"&{mut}{value}"
             if typename == self._default_type and kw.startswith("pub "):
                 typename = self._typename_from_value(node.value)
+            if typename == self._default_type and kw.startswith("pub "):
+                typename = "TODO_py2many_unknown"
             optional_typename = (
                 f": {typename}"
                 if typename != self._default_type or kw.startswith("pub ")
@@ -925,10 +1075,8 @@ class RustTranspiler(CLikeTranspiler):
 
     def visit_Raise(self, node) -> str:
         if node.exc is not None:
-            return f"raise!({self.visit(node.exc)}); //unsupported"
-        # This handles the case where `raise` is used without
-        # specifying the exception.
-        return "raise!(); //unsupported"
+            return f"return Err({self.visit(node.exc)}.into());"
+        return "return Err(crate::Py2ManyError::Reraise.into());"
 
     def visit_Await(self, node) -> str:
         value = self.visit(node.value)
@@ -986,7 +1134,7 @@ class RustTranspiler(CLikeTranspiler):
         return "//global {}".format(", ".join(node.names))
 
     def visit_Starred(self, node) -> str:
-        return f"starred!({self.visit(node.value)})/*unsupported*/"
+        return f"starred!({self.visit(node.value)})"
 
     def visit_Set(self, node) -> str:
         self._usings.add("std::collections::HashSet")
@@ -1008,22 +1156,23 @@ class RustTranspiler(CLikeTranspiler):
         return f"if {test} {{ {body} }} else {{ {orelse} }}"
 
     def visit_Try(self, node, finallybody=None) -> str:
-        super().visit_Try(node, finallybody)
-        # if we got here, parent didn't throw. This can only
-        # be because of --no-strict
-        self._features.add("try_blocks")
-        buf = ["let result: Result<_, std::error::Error> = try { "]
         body = "\n".join([self.visit(n) for n in node.body])
-        buf.append(body)
-        buf.append("};")
-
+        buf = [
+            "let result: Result<(), Box<dyn std::error::Error>> = (|| {",
+            body,
+            "Ok(())",
+            "})();",
+            "match result {",
+        ]
+        buf.append("Ok(_) => {},")
         for handler in node.handlers:
-            buf.append("//" + self.visit(handler))
-
+            buf.append(self.visit(handler))
         if finallybody:
-            buf.append("//" + self.visit(finallybody))
-
+            buf.append(self.visit(finallybody))
+        buf.append("}")
         return "\n".join(buf)
 
     def visit_ExceptHandler(self, node) -> str:
-        return "unsupported exception handler"
+        name = node.name or "_"
+        body = "\n".join([self.visit(n) for n in node.body])
+        return f"Err({name}) => {{\n{body}\n}},"
