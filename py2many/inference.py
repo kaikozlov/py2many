@@ -548,7 +548,21 @@ class InferTypesTransformer(ast.NodeTransformer):
             node.annotation = ast.Name(id=left_id)
             return node
 
-        LEGAL_COMBINATIONS = {("str", ast.Mod), ("List", ast.Add)}
+        # String concatenation
+        if isinstance(node.op, ast.Add):
+            if (
+                (isinstance(node.left, ast.Constant) and isinstance(node.left.value, str))
+                or (
+                    isinstance(node.right, ast.Constant)
+                    and isinstance(node.right.value, str)
+                )
+                or left_id == "str"
+                or right_id == "str"
+            ):
+                node.annotation = ast.Name(id="str")
+                return node
+
+        LEGAL_COMBINATIONS = {("str", ast.Mod), ("str", ast.Add), ("List", ast.Add)}
 
         if left_id is not None and (left_id, type(node.op)) not in LEGAL_COMBINATIONS:
             raise AstUnrecognisedBinOp(left_id, right_id, node)

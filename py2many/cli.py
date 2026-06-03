@@ -110,6 +110,13 @@ def _transpile(
     successful = []
     for filename, tree in zip(topo_filenames, trees):
         try:
+            if hasattr(transpiler, "set_available_local_mods"):
+                available = {
+                    t.__file__.stem
+                    for t in trees
+                    if getattr(t, "__file__", None) and t.__file__.stem != "__init__"
+                }
+                transpiler.set_available_local_mods(available)
             output = _transpile_one(
                 trees, tree, transpiler, rewriters, transformers, post_rewriters, args
             )

@@ -15,10 +15,14 @@ class DeclarationExtractor(ast.NodeVisitor):
         self._function_depth = 0
 
     def _maybe_rename_key(self, key):
+        from py2many.pyrs.rust_emit import escape_rust_ident
+
+        escaped = escape_rust_ident(key)
+        if escaped != key:
+            return escaped
         if key in self.transpiler._keywords:
             return key + "_"
-        else:
-            return key
+        return key
 
     def _typename_from_value(self, value):
         if hasattr(value, "kfx_rust_type"):

@@ -122,6 +122,50 @@ class RustTranspilerPlugins:
             f"encountered range() call with unknown parameters: range({vargs})"
         )
 
+    def visit_struct_pack(self, node, vargs: List[str]) -> str:
+        self._usings.add("pylib::struct_pack")
+        return f"struct_pack({', '.join(vargs)})"
+
+    def visit_struct_unpack(self, node, vargs: List[str]) -> str:
+        self._usings.add("pylib::struct_unpack")
+        return f"struct_unpack({', '.join(vargs)})"
+
+    def visit_bytesio(self, node, vargs: List[str]) -> str:
+        self._usings.add("pylib::BytesIO")
+        if vargs:
+            return f"BytesIO::from_bytes({vargs[0]})"
+        return "BytesIO::new()"
+
+    def visit_zipfile(self, node, vargs: List[str]) -> str:
+        self._usings.add("pylib::ZipFile")
+        return f"ZipFile::open({', '.join(vargs)})"
+
+    def visit_sqlite3_connect(self, node, vargs: List[str]) -> str:
+        self._usings.add("pylib::sqlite3_connect")
+        return f"sqlite3_connect({', '.join(vargs)})"
+
+    def visit_decimal_decimal(self, node, vargs: List[str]) -> str:
+        self._usings.add("pylib::Decimal")
+        if vargs:
+            return f"Decimal::new({vargs[0]})"
+        return "Decimal::default()"
+
+    def visit_ctypes_structure(self, node, vargs: List[str]) -> str:
+        self._usings.add("pylib::ctypes")
+        return f"ctypes_structure({', '.join(vargs)})"
+
+    def visit_xml_etree_parse(self, node, vargs: List[str]) -> str:
+        self._usings.add("pylib::xml_etree_parse")
+        return f"xml_etree_parse({', '.join(vargs)})"
+
+    def visit_pil_image_open(self, node, vargs: List[str]) -> str:
+        self._usings.add("pylib::pil_image_open")
+        return f"pil_image_open({', '.join(vargs)})"
+
+    def visit_pypdf_reader(self, node, vargs: List[str]) -> str:
+        self._usings.add("pylib::PdfReader")
+        return f"PdfReader::new({', '.join(vargs)})"
+
     def visit_print(self, node, vargs: List[str]) -> str:
         placeholders = []
         for n in node.args:
@@ -226,6 +270,20 @@ FUNC_DISPATCH_TABLE: Dict[FuncType, Tuple[Callable, bool]] = {
     "f.write": (RustTranspilerPlugins.visit_write, True),
     "f.close": (lambda self, node, vargs: "drop(f)", False),
     "Error": (lambda self, node, vargs: f"anyhow::bail!({vargs[0]})", False),
+    "struct.pack": (RustTranspilerPlugins.visit_struct_pack, True),
+    "struct.unpack": (RustTranspilerPlugins.visit_struct_unpack, True),
+    "io.BytesIO": (RustTranspilerPlugins.visit_bytesio, True),
+    "BytesIO": (RustTranspilerPlugins.visit_bytesio, True),
+    "zipfile.ZipFile": (RustTranspilerPlugins.visit_zipfile, True),
+    "sqlite3.connect": (RustTranspilerPlugins.visit_sqlite3_connect, True),
+    "decimal.Decimal": (RustTranspilerPlugins.visit_decimal_decimal, True),
+    "ctypes.Structure": (RustTranspilerPlugins.visit_ctypes_structure, True),
+    "ElementTree.parse": (RustTranspilerPlugins.visit_xml_etree_parse, True),
+    "xml.etree.ElementTree.parse": (RustTranspilerPlugins.visit_xml_etree_parse, True),
+    "Image.open": (RustTranspilerPlugins.visit_pil_image_open, True),
+    "PIL.Image.open": (RustTranspilerPlugins.visit_pil_image_open, True),
+    "PdfReader": (RustTranspilerPlugins.visit_pypdf_reader, True),
+    "pypdf.PdfReader": (RustTranspilerPlugins.visit_pypdf_reader, True),
     open: (RustTranspilerPlugins.visit_open, True),
     NamedTemporaryFile: (RustTranspilerPlugins.visit_named_temp_file, True),
     io.TextIOWrapper.read: (RustTranspilerPlugins.visit_textio_read, True),

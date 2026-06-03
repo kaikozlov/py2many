@@ -77,6 +77,7 @@ METHOD_RETURNS = {
     ("HashMap<IonSymbol, HashMap<IonSymbol, IonValue>>", "get"): "IonValue",
     ("HashMap<String, KfxEpubResource>", "get"): "Option<KfxEpubResource>",
     ("HashMap<String, OutputFile>", "get"): "Option<OutputFile>",
+    ("YJ_Book", "get_container"): "YJContainer",
     ("YJ_Book", "get_fragment"): "IonValue",
     ("YJ_Book", "get_named_fragment"): "IonValue",
     ("KFX_EPUB", "get_fragment"): "IonValue",
@@ -90,8 +91,11 @@ METHOD_NAME_RETURNS = {
     "deserialize_annotated_value": "IonAnnotation",
     "deserialize_multiple_values": "Vec<IonValue>",
     "deserialize_single_value": "IonValue",
+    "get_container": "YJContainer",
     "get_shared_symbol_table": "Option<IonSharedSymbolTable>",
     "get_symbol": "IonSymbol",
+    "items": "Vec<(IonSymbol, IonValue)>",
+    "values": "Vec<IonValue>",
 }
 
 FREE_FUNCTION_RETURNS = {
@@ -118,6 +122,10 @@ ION_TYPE_NAMES = {
 }
 
 CLASS_FIELD_TYPES = {
+    "Book": {
+        "symtab": "LocalSymbolTable",
+        "chapters": "HashMap<String, Vec<String>>",
+    },
     "BookMetadata": {
         "fragments": "YJFragmentList",
         "symtab": "LocalSymbolTable",
@@ -329,14 +337,27 @@ class KfxRustTypeResolver(ast.NodeTransformer):
                 return CONSTRUCTOR_TYPES[fname]
             if fname in FREE_FUNCTION_RETURNS:
                 return FREE_FUNCTION_RETURNS[fname]
+            if fname == "defaultdict" and node.args:
+                factory = get_id(node.args[0])
+                if factory == "list":
+                    return "Vec"
+                if factory == "set":
+                    return "HashSet"
+                if factory == "dict":
+                    return "HashMap"
             if fname == "set":
                 return "HashSet"
             if isinstance(node.func, ast.Attribute):
                 receiver_type = self._type_of_expr(node.func.value)
                 method_name = node.func.attr
-                return METHOD_RETURNS.get(
-                    (receiver_type, method_name)
-                ) or METHOD_NAME_RETURNS.get(method_name)
+                if method_name == "setdefault" and node.args:
+                    value_type = self._type_of_expr(node.args[-1]) or TODO_TYPE
+                    if receiver_type and receiver_type.startswith("HashMap<"):
+                        return value_type
+                mapped = METHOD_RETURNS.get((receiver_type, method_name))
+                if mapped:
+                    return mapped
+                return METHOD_NAME_RETURNS.get(method_name)
         if isinstance(node, ast.List):
             if node.elts:
                 element_type = self._type_of_expr(node.elts[0]) or TODO_TYPE
@@ -391,6 +412,7 @@ class KfxRustTypeResolver(ast.NodeTransformer):
     def _collect_self_field_constraints(self, node: ast.ClassDef) -> Dict[str, str]:
         fields = {}
         empty_containers = {}
+        none_initialized = set()
 
         for child in ast.walk(node):
             if isinstance(child, ast.Assign):
@@ -407,7 +429,30 @@ class KfxRustTypeResolver(ast.NodeTransformer):
                 field = self._self_field_name(target)
                 if field is None:
                     continue
+                if (
+                    isinstance(child.value, ast.Call)
+                    and get_id(child.value.func) == "defaultdict"
+                    and child.value.args
+                ):
+                    factory = get_id(child.value.args[0])
+                    if factory == "list":
+                        fields[field] = f"HashMap<{TODO_TYPE}, Vec<{TODO_TYPE}>>"
+                    elif factory == "set":
+                        fields[field] = f"HashMap<{TODO_TYPE}, HashSet<{TODO_TYPE}>>"
+                    elif factory == "dict":
+                        fields[field] = f"HashMap<{TODO_TYPE}, HashMap<{TODO_TYPE}, {TODO_TYPE}>>"
+                    continue
+                if (
+                    isinstance(child.value, ast.Constant)
+                    and child.value.value is None
+                ):
+                    none_initialized.add(field)
+                    continue
                 inferred = self._type_of_expr(child.value)
+                if field in none_initialized and inferred:
+                    fields[field] = inferred
+                    none_initialized.discard(field)
+                    continue
                 if inferred in {"Vec", "HashSet", "HashMap"}:
                     empty_containers[field] = inferred
                 elif inferred:
@@ -417,13 +462,33 @@ class KfxRustTypeResolver(ast.NodeTransformer):
                 field = self._self_field_name(child.func.value)
                 if field is None:
                     continue
+                if child.func.attr == "setdefault" and child.args:
+                    value_type = self._type_of_expr(child.args[-1]) or TODO_TYPE
+                    if field in empty_containers and empty_containers[field] == "HashMap":
+                        key_type = (
+                            self._type_of_expr(child.args[0]) if child.args else TODO_TYPE
+                        )
+                        fields.setdefault(
+                            field, f"HashMap<{key_type or TODO_TYPE}, {value_type}>"
+                        )
+                    continue
                 if field not in empty_containers:
                     continue
 
-                if child.func.attr in {"append", "add", "extend"} and child.args:
+                if child.func.attr in {"append", "add", "extend", "update"} and child.args:
                     element_type = self._type_of_expr(child.args[0]) or TODO_TYPE
                     if child.func.attr == "extend":
                         element_type = self._vec_element_type(element_type)
+                    if child.func.attr == "update" and empty_containers[field] == "HashMap":
+                        if isinstance(child.args[0], ast.Dict) and child.args[0].keys:
+                            key_type = self._type_of_expr(child.args[0].keys[0]) or TODO_TYPE
+                            value_type = (
+                                self._type_of_expr(child.args[0].values[0]) or TODO_TYPE
+                            )
+                            fields.setdefault(
+                                field, f"HashMap<{key_type}, {value_type}>"
+                            )
+                        continue
                     fields.setdefault(
                         field,
                         self._container_with_element(

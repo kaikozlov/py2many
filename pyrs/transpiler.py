@@ -20,6 +20,7 @@ from py2many.tracer import defined_before, is_class_or_module, is_list
 from .clike import CLikeTranspiler
 from .inference import get_inferred_rust_type, map_type
 from .kfx_types import CONSTRUCTOR_TYPES
+from .rust_emit import escape_rust_ident, rust_string_literal, sanitize_rust_module_name
 from .plugins import (
     ATTR_DISPATCH_TABLE,
     CLASS_DISPATCH_TABLE,
@@ -92,6 +93,36 @@ class RustTranspiler(CLikeTranspiler):
         self._attr_dispatch_table = ATTR_DISPATCH_TABLE
         self._allows = set()
         self._rust_mods = set()
+        self._available_local_mods: set[str] = set()
+
+    def set_available_local_mods(self, module_names: set[str]) -> None:
+        self._available_local_mods = module_names
+
+    def _reset(self):
+        available = self._available_local_mods
+        super()._reset()
+        self._available_local_mods = available
+        self._rust_mods = set()
+
+    def _is_module_level(self, node) -> bool:
+        if not hasattr(node, "scopes"):
+            return False
+        for scope in node.scopes:
+            if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                return False
+        return True
+
+    def _wrap_module_init(self, node, body: str) -> str:
+        return f"pub fn __module_init_{node.lineno}() {{\n{body}\n}}"
+
+    def _declare_local_mod(self, module_name: str) -> bool:
+        safe_name = sanitize_rust_module_name(module_name)
+        if not safe_name or not self._available_local_mods:
+            return False
+        if safe_name not in self._available_local_mods:
+            return False
+        self._rust_mods.add(safe_name)
+        return True
 
     def usings(self):
         if self._extension:
@@ -99,11 +130,19 @@ class RustTranspiler(CLikeTranspiler):
             self._usings.add("pyo3::wrap_pyfunction")
         usings = sorted(list(set(self._usings)))
         deps = sorted(
-            {mod.split("::")[0] for mod in usings if not mod.startswith("std:")}
+            {
+                mod.split("::")[0]
+                for mod in usings
+                if not mod.startswith("std:") and mod.split("::")[0]
+            }
         )
         crates = [dep.replace("-", "_") for dep in deps]
         externs = [f"extern crate {dep};" for dep in crates]
-        externs += [f"mod {dep};" for dep in self._rust_mods]
+        externs += [
+            f"mod {dep};"
+            for dep in sorted(self._rust_mods)
+            if dep and dep not in {".", "__init__"}
+        ]
         deps_str = "\n//! ".join([f'{dep} = "*"' for dep in deps])
         externs = "\n".join(externs)
         uses = [
@@ -181,7 +220,10 @@ class RustTranspiler(CLikeTranspiler):
     def visit_Expr(self, node) -> str:
         if hasattr(node, "unused"):
             self._allows.add("clippy::no_effect")
-        return super().visit_Expr(node)
+        result = super().visit_Expr(node)
+        if self._is_module_level(node) and result.strip():
+            return self._wrap_module_init(node, result)
+        return result
 
     def visit_FunctionDef(self, node, async_prefix="") -> str:
         is_constructor = node.name == "__init__"
@@ -243,7 +285,7 @@ class RustTranspiler(CLikeTranspiler):
 
         extension = "#[pyfunction]\n" if self.extension else ""
         args_list = ", ".join(args_list)
-        fn_name = "new" if is_constructor else node.name
+        fn_name = "new" if is_constructor else escape_rust_ident(node.name)
         funcdef = f"{extension}pub {async_prefix}fn {fn_name}{template}({args_list}) {return_type}"
         return_success = (
             "Ok(())" if is_python_main else ""
@@ -268,7 +310,7 @@ class RustTranspiler(CLikeTranspiler):
             if hasattr(node, "container_type"):
                 # Python passes by reference by default. Rust needs explicit borrowing
                 typename = f"&{mut}{typename}"
-        return (typename, id)
+        return (typename, escape_rust_ident(id))
 
     def visit_Return(self, node) -> str:
         fndef = None
@@ -310,8 +352,8 @@ class RustTranspiler(CLikeTranspiler):
         attr = node.attr
         if attr == "__init__":
             attr = "new"
-        if attr in self._keywords:
-            attr = attr + "_"
+        else:
+            attr = escape_rust_ident(attr)
 
         value_id = self.visit(node.value)
 
@@ -355,14 +397,13 @@ class RustTranspiler(CLikeTranspiler):
             for arg, decl in zip(node.args, fndef.declarations.keys()):
                 arg = self.visit(arg)
                 if decl in self._keywords:
-                    decl += "_"
+                    decl = escape_rust_ident(decl)
                 vargs += [f"{decl}: {arg}"]
         if node.keywords:
             for kw in node.keywords:
                 value = self.visit(kw.value)
-                if kw.arg in self._keywords:
-                    kw.arg += "_"
-                vargs += [f"{kw.arg}: {value}"]
+                arg_name = escape_rust_ident(kw.arg) if kw.arg else kw.arg
+                vargs += [f"{arg_name}: {value}"]
         args = ", ".join(vargs)
         return f"{fname}{{{args}}}"
 
@@ -389,19 +430,37 @@ class RustTranspiler(CLikeTranspiler):
         if node.keywords:
             vargs += [self.visit(kw.value) for kw in node.keywords]
 
-        if fname in CONSTRUCTOR_TYPES and isinstance(fndef, ast.ClassDef):
-            return f"{fname}({', '.join(vargs)})"
-
         if isinstance(fndef, ast.ClassDef):
+            if fname in CONSTRUCTOR_TYPES or any(
+                isinstance(body_item, ast.FunctionDef) and body_item.name == "__new__"
+                for body_item in fndef.body
+            ):
+                return f"{fname}({', '.join(vargs)})"
             return self._visit_struct_literal(node, fname, fndef)
 
         if fname == "isinstance" and len(vargs) >= 2:
+            type_arg = vargs[1].strip()
+            if type_arg.startswith("&"):
+                type_arg = type_arg[1:]
+            if type_arg.startswith("(") or "." in type_arg or "(" in type_arg:
+                self._usings.add("pylib::is_instance")
+                return f"is_instance(&{vargs[0]}, &{vargs[1]})"
             return f"is_instance::<{vargs[1]}>(&{vargs[0]})"
         if fname == "hasattr" and len(vargs) >= 2:
             return f"has_attr(&{vargs[0]}, {vargs[1]})"
-        if fname in {"re.match_", "re::match_"} and len(vargs) >= 2:
+        if fname in {"re.match_", "re::match_", "re.r#match", "re::r#match"} and len(
+            vargs
+        ) >= 2:
             self._usings.add("regex::Regex")
             return f"Regex::new({vargs[0]}).unwrap().is_match(&{vargs[1]})"
+        if fname in {
+            "re.compile",
+            "re::compile",
+            "re.r#compile",
+            "re::r#compile",
+        } and len(vargs) >= 1:
+            self._usings.add("regex::Regex")
+            return f"Regex::new({vargs[0]}).unwrap()"
         if fname in {"re.split", "re::split"} and len(vargs) >= 2:
             self._usings.add("regex::Regex")
             return f"Regex::new({vargs[0]}).unwrap().split(&{vargs[1]}).collect::<Vec<_>>()"
@@ -414,6 +473,25 @@ class RustTranspiler(CLikeTranspiler):
                 node_result_type = False
             unwrap = "?" if node_result_type or node_func_result_type else ""
             return f"{ret}{unwrap}"
+
+        struct_pack = fname in {
+            "struct.pack",
+            "r#struct.pack",
+            "struct::pack",
+            "r#struct::pack",
+        }
+        if struct_pack and vargs:
+            self._usings.add("pylib::struct_pack")
+            return f"struct_pack({', '.join(vargs)})"
+        struct_unpack = fname in {
+            "struct.unpack",
+            "r#struct.unpack",
+            "struct::unpack",
+            "r#struct::unpack",
+        }
+        if struct_unpack and vargs:
+            self._usings.add("pylib::struct_unpack")
+            return f"struct_unpack({', '.join(vargs)})"
 
         # Check if some args need to be passed by reference
         ref_args = []
@@ -437,10 +515,21 @@ class RustTranspiler(CLikeTranspiler):
         buf.append(f"for {target} in {it} {{")
         buf.extend([self.visit(c) for c in node.body])
         buf.append("}")
-        return "\n".join(buf)
+        body = "\n".join(buf)
+        if self._is_module_level(node):
+            return self._wrap_module_init(node, body)
+        return body
 
     def visit_Str(self, node) -> str:
-        return "" + super().visit_Str(node) + ""
+        value = node.value if isinstance(node, ast.Constant) else node.s
+        return rust_string_literal(value)
+
+    def visit_Constant(self, node) -> str:
+        if isinstance(node.value, str):
+            return rust_string_literal(node.value)
+        elif isinstance(node.value, bytes):
+            return self.visit_Bytes(node)
+        return str(self.visit_NameConstant(node))
 
     def visit_Bytes(self, node) -> str:
         bytes_str = self._get_bytes(node)
@@ -530,6 +619,8 @@ class RustTranspiler(CLikeTranspiler):
         )
         if make_block:
             return f"{ret};"
+        if self._is_module_level(node):
+            return self._wrap_module_init(node, ret)
         return ret
 
     def visit_While(self, node) -> str:
@@ -551,14 +642,7 @@ class RustTranspiler(CLikeTranspiler):
 
     @staticmethod
     def _rust_string_literal(value: str) -> str:
-        escaped = (
-            value.replace("\\", "\\\\")
-            .replace('"', '\\"')
-            .replace("\n", "\\n")
-            .replace("\r", "\\r")
-            .replace("\t", "\\t")
-        )
-        return f'"{escaped}"'
+        return rust_string_literal(value)
 
     @staticmethod
     def _rust_format_placeholder(conversion: str) -> str:
@@ -682,8 +766,26 @@ class RustTranspiler(CLikeTranspiler):
         ):
             elt, n = self.visit(node.left.elts[0]), self.visit(node.right)
             return f"vec![{elt};{n}]"
-        else:
-            return super().visit_BinOp(node)
+        if isinstance(node.op, ast.Add):
+            left = self.visit(node.left)
+            right = self.visit(node.right)
+            ann = getattr(node, "annotation", None)
+            if ann and get_id(ann) == "str":
+                return f'format!("{{}}{{}}", {left}, {right})'
+            left_type = self._typename_from_annotation(node.left)
+            right_type = self._typename_from_annotation(node.right)
+            is_str_add = "str" in left_type or "str" in right_type
+            if not is_str_add:
+                is_str_add = (
+                    isinstance(node.left, ast.Constant)
+                    and isinstance(node.left.value, str)
+                ) or (
+                    isinstance(node.right, ast.Constant)
+                    and isinstance(node.right.value, str)
+                )
+            if is_str_add:
+                return f'format!("{{}}{{}}", {left}, {right})'
+        return super().visit_BinOp(node)
 
     def visit_sealed_class(self, node) -> str:
         variants = []
@@ -815,17 +917,35 @@ class RustTranspiler(CLikeTranspiler):
         if name == "re":
             self._usings.add("regex::Regex")
             return ""
-        if name not in self._rust_ignored_module_set:
+        safe_name = sanitize_rust_module_name(name)
+        if name == "struct":
+            self._usings.add("pylib::struct_pack")
+            return ""
+        if name not in self._rust_ignored_module_set and safe_name:
             self._usings.add(self._rust_module_path(name))
         return ""
 
     def _import_from(self, module_name: str, names: List[str], level: int = 0) -> str:
         if module_name in self._rust_ignored_module_set:
             return ""
-        if level > 0:
-            self._rust_mods.add(module_name)
-        else:
-            self._usings.add(self._rust_crate_name(module_name))
+        safe_module = sanitize_rust_module_name(module_name)
+        if level > 0 and (not module_name or module_name == "."):
+            declared = []
+            for name in names:
+                safe_name = sanitize_rust_module_name(name)
+                if not safe_name:
+                    continue
+                self._declare_local_mod(safe_name)
+                declared.append(f"{safe_name}::*")
+            if declared:
+                return f"use {', '.join(declared)};"
+            return ""
+        if level > 0 and safe_module:
+            self._declare_local_mod(safe_module)
+        elif module_name and module_name != ".":
+            crate = self._rust_crate_name(module_name)
+            if crate:
+                self._usings.add(crate)
         if len(names) == 1:
             # TODO: make this more generic so it works for len(names) > 1
             name = names[0]
@@ -833,8 +953,10 @@ class RustTranspiler(CLikeTranspiler):
             if lookup in MODULE_DISPATCH_TABLE:
                 rust_use = MODULE_DISPATCH_TABLE[lookup]
                 return f"use {rust_use};"
+        if not module_name or module_name == ".":
+            return ""
         module_name = self._rust_module_path(module_name)
-        names = ", ".join(names)
+        names = ", ".join(escape_rust_ident(n) for n in names)
         return f"use {module_name}::{{{names}}};"
 
     def visit_List(self, node) -> str:
@@ -865,8 +987,46 @@ class RustTranspiler(CLikeTranspiler):
     def _cast(self, name: str, to) -> str:
         return f"{name} as {to}"
 
+    def _slice_bound_is_negative(self, node_expr) -> bool:
+        return isinstance(node_expr, ast.UnaryOp) and isinstance(node_expr.op, ast.USub)
+
+    def _visit_slice_range(self, node, value: str) -> str:
+        sl = node.slice
+        lower = self.visit(sl.lower) if sl.lower else None
+        upper = self.visit(sl.upper) if sl.upper else None
+        step = self.visit(sl.step) if sl.step else None
+        needs_helper = step is not None
+        needs_helper = needs_helper or self._slice_bound_is_negative(sl.lower)
+        needs_helper = needs_helper or self._slice_bound_is_negative(sl.upper)
+
+        if needs_helper:
+            self._usings.add("pylib::python_slice")
+            lower_expr = lower if lower is not None else "None"
+            upper_expr = upper if upper is not None else "None"
+            step_expr = step if step is not None else "None"
+            return f"python_slice({value}, {lower_expr}, {upper_expr}, {step_expr})"
+
+        if lower is None and upper is None:
+            return f"&{value}[..]"
+        if lower is None:
+            return f"&{value}[..{upper}]"
+        if upper is None:
+            return f"&{value}[{lower}..]"
+        return f"&{value}[{lower}..{upper}]"
+
+    def _visit_negative_index(self, node, value: str, index: str) -> str:
+        self._usings.add("pylib::python_index")
+        return f"python_index({value}, {index})"
+
     def visit_Subscript(self, node) -> str:
+        if isinstance(node.slice, ast.Slice):
+            value = self.visit(node.value)
+            return self._visit_slice_range(node, value)
+
         value = self.visit(node.value)
+        if self._slice_bound_is_negative(node.slice):
+            index = self.visit(node.slice)
+            return self._visit_negative_index(node, value, index)
         index = self.visit(node.slice)
         if hasattr(node, "is_annotation"):
             if value in self._container_type_map:
@@ -1055,7 +1215,23 @@ class RustTranspiler(CLikeTranspiler):
             if typename is None:
                 typename = self._typename_from_annotation(target)
             needs_cast = self._needs_cast(target, node.value)
-            target_str = self.visit(target)
+            if isinstance(target, ast.Tuple):
+                mut_elts = []
+                any_mut = False
+                for elt in target.elts:
+                    elt_name = get_id(elt)
+                    if elt_name and is_mutable(node.scopes, elt_name):
+                        any_mut = True
+                        mut_elts.append(f"mut {self.visit(elt)}")
+                    else:
+                        mut_elts.append(self.visit(elt))
+                if any_mut:
+                    target_str = f"({', '.join(mut_elts)})"
+                    kw = "let"
+                else:
+                    target_str = self.visit(target)
+            else:
+                target_str = self.visit(target)
             value = self.visit(node.value)
             if needs_cast:
                 value = self._assign_cast(
@@ -1178,7 +1354,10 @@ class RustTranspiler(CLikeTranspiler):
         if finallybody:
             buf.append(self.visit(finallybody))
         buf.append("}")
-        return "\n".join(buf)
+        result = "\n".join(buf)
+        if self._is_module_level(node):
+            return self._wrap_module_init(node, result)
+        return result
 
     def visit_ExceptHandler(self, node) -> str:
         name = node.name or "_"

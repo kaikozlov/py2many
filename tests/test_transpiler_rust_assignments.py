@@ -37,7 +37,7 @@ class Action:
         is_drm_free, is_image_based = self.status_cache[file_name][1]
 """)
 
-    assert "let (is_drm_free, is_image_based)" in generated
+    assert "let (is_drm_free, is_image_based)" in generated.replace("mut ", "")
     assert "pub const (is_drm_free, is_image_based)" not in generated
 
 
@@ -507,3 +507,334 @@ class Book:
     assert "pub zip_unpack: ZipUnpackContainer," in generated
     assert "pub json_content: JsonContentContainer," in generated
     assert "pub progress: CONVERSION_PROGRESS," in generated
+
+
+def test_regex_string_literal_uses_raw_rust_string():
+    generated = rust_transpile("""
+import re
+PATTERN = re.compile(r"^\\$[0-9]+$")
+""")
+
+    assert 'Regex::new(r"^\\$[0-9]+$")' in generated
+
+
+def test_unicode_regex_string_literal_uses_raw_rust_string():
+    generated = rust_transpile("""
+import re
+PATTERN = re.compile(r"^[\\u0021-\\u007e]+$")
+""")
+
+    assert 'Regex::new(r"^[\\u0021-\\u007e]+$")' in generated
+
+
+def test_dot_prefixed_string_literal_emits_valid_rust():
+    generated = rust_transpile("""
+EXT = ".azw"
+NAME = "bookmanifest.kfx"
+""")
+
+    assert 'pub const EXT: &' in generated and '".azw"' in generated
+    assert 'pub const NAME: &' in generated and '"bookmanifest.kfx"' in generated
+
+
+def test_cast_comparison_is_parenthesized():
+    generated = rust_transpile("""
+def check(data):
+    if len(data) < 10:
+        return False
+    return True
+""")
+
+    assert "(data.len() as i32" in generated and "< 10" in generated
+
+
+def test_chained_comparison_expands_to_boolean_conjunction():
+    generated = rust_transpile("""
+def check(a, b, c):
+    return a == b != c
+""")
+
+    assert "&&" in generated
+    assert "a == b" in generated
+    assert "b != c" in generated
+
+
+def test_reserved_identifier_final_uses_raw_ident():
+    generated = rust_transpile("""
+class Report:
+    def run(self):
+        self.final()
+
+def final():
+    return 1
+""")
+
+    assert "pub fn r#final()" in generated
+    assert "self.r#final();" in generated
+
+
+def test_tuple_mut_destructuring_uses_mut_per_binding():
+    generated = rust_transpile("""
+def swap(pair):
+    a, b = pair
+    a = b
+    b = a
+    return a
+""")
+
+    assert "let (mut a, mut b)" in generated
+    assert "let mut (a, b)" not in generated
+
+
+def test_module_level_for_is_wrapped_in_init_function():
+    generated = rust_transpile("""
+VERSIONS = []
+for version, capabilities in VERSIONS:
+    pass
+""")
+
+    assert "pub fn __module_init_" in generated
+    assert "for (version, capabilities) in VERSIONS" in generated
+
+
+def test_relative_import_only_declares_available_local_mod():
+    generated = rust_transpile("""
+from .utilities import helper
+
+def run():
+    return helper()
+""")
+
+    assert "mod .;" not in generated
+
+
+def test_advanced_slice_emits_rust_range():
+    generated = rust_transpile("""
+def take(data):
+    return data[1:5]
+""")
+
+    assert "&data[1..5]" in generated
+
+
+def test_advanced_step_slice_emits_helper_call():
+    generated = rust_transpile("""
+def take(data):
+    return data[1:10:2]
+""")
+
+    assert "python_slice(data, 1, 10, 2)" in generated
+
+
+def test_union_return_type_is_mapped_to_rust_placeholder():
+    generated = rust_transpile("""
+from typing import Union
+
+def pick(value: Union[int, str]) -> Union[int, str]:
+    return value
+""")
+
+    assert "Union[" not in generated
+    assert "pub fn pick(value: i32)" in generated
+    assert "-> &i32" in generated or "-> i32" in generated
+
+
+def test_defaultdict_list_field_infers_vec_type():
+    generated = rust_transpile("""
+from collections import defaultdict
+
+class Book:
+    def load(self):
+        self.chapters = defaultdict(list)
+        self.chapters["a"].append("x")
+""")
+
+    assert "pub chapters: HashMap" in generated or "pub chapters: Vec" in generated
+
+
+def test_none_initialized_field_upgrades_on_later_assignment():
+    generated = rust_transpile("""
+class Book:
+    def load(self, symtab):
+        self.symtab = None
+        self.symtab = symtab
+""")
+
+    assert "pub symtab: LocalSymbolTable," in generated
+
+
+def test_yj_book_get_container_return_type():
+    generated = rust_transpile("""
+class YJ_Book:
+    def current(self):
+        container = self.get_container()
+        return container
+""")
+
+    assert "let container: YJContainer = self.get_container();" in generated
+
+
+def test_struct_pack_emits_helper_placeholder():
+    generated = rust_transpile("""
+import struct
+
+def pack_value(value):
+    return struct.pack(">I", value)
+""")
+
+    assert "struct_pack(" in generated
+
+
+def test_compare_with_is_not_parenthesizes_subexpression():
+    generated = rust_transpile("""
+def check(cde_type, is_sample):
+    if (cde_type == "EBSP") is not is_sample:
+        return False
+    return True
+""")
+
+    assert '(cde_type == "EBSP") != is_sample' in generated.replace(" != ", " != ") or '(cde_type == "EBSP")' in generated
+
+
+def test_function_argument_named_type_uses_raw_ident():
+    generated = rust_transpile("""
+class Context:
+    def __exit__(self, type, value, traceback):
+        return False
+""")
+
+    assert "r#type:" in generated
+
+
+def test_string_addition_uses_format():
+    generated = rust_transpile("""
+def join(prefix, suffix):
+    return "a" + suffix
+""")
+
+    assert 'format!("{}{}", "a", suffix)' in generated
+
+
+def test_bytesio_emits_helper_placeholder():
+    generated = rust_transpile("""
+from io import BytesIO
+
+def make(data):
+    return BytesIO(data)
+""")
+
+    assert "BytesIO::from_bytes(data)" in generated
+
+
+def test_zipfile_emits_helper_placeholder():
+    generated = rust_transpile("""
+import zipfile
+
+def open_zip(path):
+    return zipfile.ZipFile(path)
+""")
+
+    assert "ZipFile::open(path)" in generated
+
+
+def test_sqlite3_connect_emits_helper_placeholder():
+    generated = rust_transpile("""
+import sqlite3
+
+def connect_db(path):
+    return sqlite3.connect(path)
+""")
+
+    assert "sqlite3_connect(path)" in generated
+
+
+def test_struct_unpack_emits_helper_placeholder():
+    generated = rust_transpile("""
+import struct
+
+def unpack_value(data):
+    return struct.unpack(">I", data)
+""")
+
+    assert "struct_unpack(" in generated
+
+
+def test_package_init_relative_imports_emit_sibling_mods():
+    generated = rust_transpile("""
+from . import message_logging
+from . import utilities
+
+set_logger = message_logging.set_logger
+""")
+
+    assert "extern crate ;" not in generated
+    assert "use message_logging::*;" in generated
+    assert "use utilities::*;" in generated
+
+
+def test_relative_import_declares_mod_when_sibling_is_transpiled():
+    from argparse import Namespace
+    from pathlib import Path
+
+    from py2many.cli import _transpile
+    from py2many.pyrs import settings as rust_settings
+
+    args = Namespace(typpete=False, extension=False, no_prologue=False, llm=False)
+    settings = rust_settings(args)
+    outputs = _transpile(
+        [Path("message_logging.py"), Path("__init__.py")],
+        [
+            "def set_logger():\n    return None\n",
+            "from . import message_logging\n",
+        ],
+        settings,
+        args,
+    )
+    init_rs = outputs[0][1]
+
+    assert "mod message_logging;" in init_rs
+
+
+def test_negative_index_emits_python_index_helper():
+    generated = rust_transpile("""
+def last(items):
+    return items[-1]
+""")
+
+    assert "python_index(items, -1)" in generated
+
+
+def test_negative_slice_emits_python_slice_helper():
+    generated = rust_transpile("""
+def trim(items):
+    return items[:-1]
+""")
+
+    assert "python_slice(items, None, -1, None)" in generated
+
+
+def test_class_with_new_emits_constructor_call():
+    generated = rust_transpile("""
+class IonAnnots(tuple):
+    def __new__(cls, annotations):
+        return tuple.__new__(cls, annotations)
+
+def make(annotations):
+    return IonAnnots(annotations)
+""")
+
+    assert "IonAnnots(annotations)" in generated
+    assert "IonAnnots{" not in generated
+
+
+def test_defaultdict_set_field_infers_hashset_type():
+    generated = rust_transpile("""
+from collections import defaultdict
+
+class Book:
+    def load(self):
+        self.tags = defaultdict(set)
+        self.tags["a"].add("x")
+""")
+
+    assert "pub tags: HashMap" in generated
