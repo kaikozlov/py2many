@@ -309,3 +309,201 @@ class IonStruct:
 
     assert "pub 0:" not in generated
     assert "self[0] = value;" in generated
+
+
+def test_kfx_ion_serial_method_return_types_are_known():
+    generated = rust_transpile("""
+def read_values(symtab, data):
+    binary = IonBinary(symtab)
+    value = binary.deserialize_single_value(data)
+    annotated = binary.deserialize_annotated_value(data)
+    values = binary.deserialize_multiple_values(data)
+    return values
+""")
+
+    assert "let binary: IonBinary = IonBinary(symtab);" in generated
+    assert "let value: IonValue = binary.deserialize_single_value(data);" in generated
+    assert (
+        "let annotated: IonAnnotation = binary.deserialize_annotated_value(data);"
+        in generated
+    )
+    assert (
+        "let values: Vec<IonValue> = binary.deserialize_multiple_values(data);"
+        in generated
+    )
+
+
+def test_kfx_symbol_table_method_return_types_are_known():
+    generated = rust_transpile("""
+def symbols(symtab, catalog):
+    local = symtab.create_local_symbol("abc")
+    existing = symtab.get_symbol(1)
+    table = catalog.get_shared_symbol_table("YJ_symbols")
+    import_value = symtab.create_import()
+    return local
+""")
+
+    assert 'let local: IonSymbol = symtab.create_local_symbol("abc");' in generated
+    assert "let existing: IonSymbol = symtab.get_symbol(1);" in generated
+    assert (
+        'let table: Option<IonSharedSymbolTable> = catalog.get_shared_symbol_table("YJ_symbols");'
+        in generated
+    )
+    assert (
+        "let import_value: Option<IonAnnotation> = symtab.create_import();" in generated
+    )
+
+
+def test_kfx_assigned_ion_type_variable_narrows_source_value():
+    generated = rust_transpile("""
+def read_value(value):
+    data_type = ion_type(value)
+    if data_type is IonSExp:
+        item = value.pop()
+        return item
+""")
+
+    assert "let data_type: IonDataType = ion_type(value);" in generated
+    assert "let item: IonValue = value.pop();" in generated
+
+
+def test_kfx_ion_type_membership_narrows_source_value():
+    generated = rust_transpile("""
+def read_value(value):
+    if ion_type(value) in {IonList, IonStruct}:
+        item = value.get("$307")
+        return item
+""")
+
+    assert 'let item: IonValue = value.get("$307");' in generated
+
+
+def test_kfx_isinstance_narrows_branch_variable():
+    generated = rust_transpile("""
+def read_fragment(fragment):
+    if isinstance(fragment, YJFragment):
+        value = fragment.value
+        return value
+""")
+
+    assert "let value: IonValue = fragment.value;" in generated
+
+
+def test_kfx_yj_book_mixin_fields_resolve_on_book_structure():
+    generated = rust_transpile("""
+class BookStructure:
+    def collect(self):
+        fragment = self.fragments.get("$490")
+        sym = self.symtab.create_local_symbol("abc")
+        return fragment
+""")
+
+    assert 'let fragment: Option<YJFragment> = self.fragments.get("$490");' in generated
+    assert 'let sym: IonSymbol = self.symtab.create_local_symbol("abc");' in generated
+
+
+def test_kfx_epub_mixin_fields_resolve_on_conversion_mixins():
+    generated = rust_transpile("""
+class KFX_EPUB_Resources:
+    def process(self, resource_name):
+        cached = self.resource_cache.get(resource_name)
+        part = self.oebps_files.get("part.xhtml")
+        data = self.book_data.get("$417", {})
+        fragment = self.book.fragments.get("$490")
+        return cached
+""")
+
+    assert (
+        "let cached: Option<KfxEpubResource> = self.resource_cache.get(resource_name);"
+        in generated
+    )
+    assert (
+        'let part: Option<OutputFile> = self.oebps_files.get("part.xhtml");'
+        in generated
+    )
+    assert (
+        'let data: IonValue = self.book_data.get("$417", HashMap::new());' in generated
+    )
+    assert (
+        'let fragment: Option<YJFragment> = self.book.fragments.get("$490");'
+        in generated
+    )
+
+
+def test_kfx_first_party_constructor_fields_are_known():
+    generated = rust_transpile("""
+class KpfContainer:
+    def load(self, file, data):
+        self.source_epub = SourceEpub(file)
+        self.kdf_datafile = DataFile("book.kdf", data)
+        self.wrapper = SQLiteFingerprintWrapper(self.kdf_datafile)
+        self.deserializer = Deserializer(data)
+""")
+
+    assert "pub source_epub: SourceEpub," in generated
+    assert "pub kdf_datafile: DataFile," in generated
+    assert "pub wrapper: SQLiteFingerprintWrapper," in generated
+    assert "pub deserializer: Deserializer," in generated
+
+
+def test_kfx_ion_type_is_not_narrows_else_branch():
+    generated = rust_transpile("""
+def read_value(value):
+    if ion_type(value) is not IonStruct:
+        return None
+    else:
+        item = value.get("$307")
+        return item
+""")
+
+    assert 'let item: IonValue = value.get("$307");' in generated
+
+
+def test_kfx_assigned_ion_type_membership_narrows_source_value():
+    generated = rust_transpile("""
+def read_value(value):
+    data_type = ion_type(value)
+    if data_type in {IonList, IonStruct}:
+        item = value.get("$307")
+        return item
+""")
+
+    assert 'let item: IonValue = value.get("$307");' in generated
+
+
+def test_kfx_isinstance_tuple_narrows_branch_variable():
+    generated = rust_transpile("""
+def read_annotation(value):
+    if isinstance(value, (IonAnnotation, YJFragment)):
+        payload = value.value
+        return payload
+""")
+
+    assert "let payload: IonValue = value.value;" in generated
+
+
+def test_kfx_empty_self_list_infers_element_from_extend_literal():
+    generated = rust_transpile("""
+class KfxContainer:
+    def load(self):
+        self.entities = []
+        self.entities.extend([KfxContainerEntity(self.symtab, 1, 2)])
+""")
+
+    assert "pub entities: Vec<KfxContainerEntity>," in generated
+
+
+def test_kfx_unpack_container_constructor_fields_are_known():
+    generated = rust_transpile("""
+class Book:
+    def load(self, symtab, datafile):
+        self.ion_text = IonTextContainer(symtab, datafile=datafile)
+        self.zip_unpack = ZipUnpackContainer(symtab, datafile=datafile)
+        self.json_content = JsonContentContainer(self)
+        self.progress = CONVERSION_PROGRESS(None)
+""")
+
+    assert "pub ion_text: IonTextContainer," in generated
+    assert "pub zip_unpack: ZipUnpackContainer," in generated
+    assert "pub json_content: JsonContentContainer," in generated
+    assert "pub progress: CONVERSION_PROGRESS," in generated
