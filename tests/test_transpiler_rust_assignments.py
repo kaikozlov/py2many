@@ -197,3 +197,115 @@ def call(args):
 
     assert "unsupported" not in generated
     assert "starred!(args)" in generated
+
+
+def test_kfx_known_constructor_types_class_fields():
+    generated = rust_transpile("""
+class Book:
+    def __init__(self, file):
+        self.datafile = DataFile(file)
+        self.symtab = LocalSymbolTable(YJ_SYMBOLS.name)
+        self.fragments = YJFragmentList()
+""")
+
+    assert "pub datafile: DataFile," in generated
+    assert "pub symtab: LocalSymbolTable," in generated
+    assert "pub fragments: YJFragmentList," in generated
+
+
+def test_kfx_empty_self_list_infers_element_from_append():
+    generated = rust_transpile("""
+class Container:
+    def __init__(self):
+        self.entities = []
+
+    def load(self):
+        self.entities.append(KfxContainerEntity(self.symtab, 1, 2))
+""")
+
+    assert "pub entities: Vec<KfxContainerEntity>," in generated
+
+
+def test_kfx_empty_self_set_infers_element_from_add():
+    generated = rust_transpile("""
+class Book:
+    def __init__(self):
+        self.reported_errors = set()
+
+    def report(self, msg):
+        self.reported_errors.add(msg)
+""")
+
+    assert "pub reported_errors: HashSet<TODO_py2many_unknown>," in generated
+
+
+def test_kfx_empty_self_dict_infers_key_value_from_subscript_assignment():
+    generated = rust_transpile("""
+class Navigation:
+    def __init__(self):
+        self.anchor_uri = {}
+
+    def add(self, anchor_name, uri):
+        self.anchor_uri[anchor_name] = uri
+""")
+
+    assert (
+        "pub anchor_uri: HashMap<TODO_py2many_unknown, TODO_py2many_unknown>,"
+        in generated
+    )
+
+
+def test_kfx_fragment_list_get_methods_have_domain_return_types():
+    generated = rust_transpile("""
+class Book:
+    def __init__(self):
+        self.fragments = YJFragmentList()
+
+    def use_fragments(self):
+        fragment = self.fragments.get("$490")
+        all_fragments = self.fragments.get_all("$490")
+        return all_fragments
+""")
+
+    assert 'let fragment: Option<YJFragment> = self.fragments.get("$490");' in generated
+    assert (
+        'let all_fragments: Vec<YJFragment> = self.fragments.get_all("$490");'
+        in generated
+    )
+
+
+def test_kfx_ion_type_check_narrows_branch_variable():
+    generated = rust_transpile("""
+def read_value(value):
+    if ion_type(value) is IonStruct:
+        item = value.get("$307")
+        return item
+""")
+
+    assert 'let item: IonValue = value.get("$307");' in generated
+
+
+def test_kfx_known_forward_constructor_emits_call_not_struct_literal():
+    generated = rust_transpile("""
+class First:
+    def __init__(self, value):
+        self.value = IonAnnots(value)
+
+class IonAnnots:
+    def __init__(self, value):
+        self.value = value
+""")
+
+    assert "__self.value = IonAnnots(value);" in generated
+    assert "IonAnnots{value: value}" not in generated
+
+
+def test_self_subscript_assignment_is_not_treated_as_struct_field():
+    generated = rust_transpile("""
+class IonStruct:
+    def set_first(self, value):
+        self[0] = value
+""")
+
+    assert "pub 0:" not in generated
+    assert "self[0] = value;" in generated

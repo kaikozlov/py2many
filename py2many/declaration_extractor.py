@@ -20,6 +20,11 @@ class DeclarationExtractor(ast.NodeVisitor):
         else:
             return key
 
+    def _typename_from_value(self, value):
+        if hasattr(value, "kfx_rust_type"):
+            return value.kfx_rust_type
+        return self.transpiler._typename_from_annotation(value)
+
     def get_declarations(self):
         # strip out default values for backward compat with callers
         typed_members = {k: v[0] for k, v in self.annotated_members.items()}
@@ -32,7 +37,7 @@ class DeclarationExtractor(ast.NodeVisitor):
 
         for member, value in self.member_assignments.items():
             if member not in typed_members:
-                typed_members[member] = self.transpiler._typename_from_annotation(value)
+                typed_members[member] = self._typename_from_value(value)
 
         typed_members = {self._maybe_rename_key(k): v for k, v in typed_members.items()}
         return typed_members
@@ -49,7 +54,7 @@ class DeclarationExtractor(ast.NodeVisitor):
         for member, value in self.member_assignments.items():
             if member not in typed_members:
                 typed_members[member] = (
-                    self.transpiler._typename_from_annotation(value),
+                    self._typename_from_value(value),
                     None,
                 )
 
@@ -132,6 +137,8 @@ class DeclarationExtractor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def is_member(self, node):
+        if not isinstance(node, ast.Attribute):
+            return False
         if hasattr(node, "value"):
             if self.transpiler.visit(node.value) == "self":
                 return True

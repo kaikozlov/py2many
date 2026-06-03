@@ -19,6 +19,7 @@ from py2many.tracer import defined_before, is_class_or_module, is_list
 
 from .clike import CLikeTranspiler
 from .inference import get_inferred_rust_type, map_type
+from .kfx_types import CONSTRUCTOR_TYPES
 from .plugins import (
     ATTR_DISPATCH_TABLE,
     CLASS_DISPATCH_TABLE,
@@ -382,14 +383,17 @@ class RustTranspiler(CLikeTranspiler):
                 return f"format!({fmt_literal}, {', '.join(args)})"
             return f"format!({fmt_literal})"
 
-        if isinstance(fndef, ast.ClassDef):
-            return self._visit_struct_literal(node, fname, fndef)
-
         vargs = []  # visited args
         if node.args:
             vargs += [self.visit(a) for a in node.args]
         if node.keywords:
             vargs += [self.visit(kw.value) for kw in node.keywords]
+
+        if fname in CONSTRUCTOR_TYPES and isinstance(fndef, ast.ClassDef):
+            return f"{fname}({', '.join(vargs)})"
+
+        if isinstance(fndef, ast.ClassDef):
+            return self._visit_struct_literal(node, fname, fndef)
 
         if fname == "isinstance" and len(vargs) >= 2:
             return f"is_instance::<{vargs[1]}>(&{vargs[0]})"
@@ -1045,7 +1049,11 @@ class RustTranspiler(CLikeTranspiler):
 
             return f"lazy_static! {{ pub static ref {target}: HashMap<{typename}> = {value}; }}"
         else:
-            typename = self._typename_from_annotation(target)
+            typename = getattr(target, "kfx_rust_type", None)
+            if typename is None:
+                typename = getattr(node.value, "kfx_rust_type", None)
+            if typename is None:
+                typename = self._typename_from_annotation(target)
             needs_cast = self._needs_cast(target, node.value)
             target_str = self.visit(target)
             value = self.visit(node.value)

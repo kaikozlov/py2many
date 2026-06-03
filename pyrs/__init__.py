@@ -4,6 +4,7 @@ from functools import partial
 from py2many.language import LanguageSettings
 
 from .inference import infer_rust_types
+from .kfx_types import resolve_kfx_rust_types
 from .transpiler import (
     RustLoopIndexRewriter,
     RustNoneCompareRewriter,
@@ -23,7 +24,7 @@ def settings(args, env=os.environ):
         ],
         None,
         [RustNoneCompareRewriter()],
-        [partial(infer_rust_types, extension=args.extension)],
+        [partial(infer_rust_types, extension=args.extension), resolve_kfx_rust_types],
         [RustLoopIndexRewriter(), RustStringJoinRewriter()],
         linter=[
             "../../scripts/rust-runner.sh",
