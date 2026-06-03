@@ -656,9 +656,15 @@ class RustTranspiler(CLikeTranspiler):
             f"flags! {{\n    pub enum {node.name}: c_int {{\n{fields}\n    }}\n}}\n\n"
         )
 
+    def _rust_module_path(self, module_name: str) -> str:
+        return module_name.replace(".", "::")
+
+    def _rust_crate_name(self, module_name: str) -> str:
+        return self._rust_module_path(module_name).split("::", 1)[0]
+
     def _import(self, name: str) -> str:
         if name not in self._rust_ignored_module_set:
-            self._usings.add(name)
+            self._usings.add(self._rust_module_path(name))
         return ""
 
     def _import_from(self, module_name: str, names: List[str], level: int = 0) -> str:
@@ -667,7 +673,7 @@ class RustTranspiler(CLikeTranspiler):
         if level > 0:
             self._rust_mods.add(module_name)
         else:
-            self._usings.add(module_name)
+            self._usings.add(self._rust_crate_name(module_name))
         if len(names) == 1:
             # TODO: make this more generic so it works for len(names) > 1
             name = names[0]
@@ -675,7 +681,7 @@ class RustTranspiler(CLikeTranspiler):
             if lookup in MODULE_DISPATCH_TABLE:
                 rust_use = MODULE_DISPATCH_TABLE[lookup]
                 return f"use {rust_use};"
-        module_name = module_name.replace(".", "::")
+        module_name = self._rust_module_path(module_name)
         names = ", ".join(names)
         return f"use {module_name}::{{{names}}};"
 
