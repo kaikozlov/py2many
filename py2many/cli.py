@@ -364,8 +364,12 @@ def _process_many(
         _get_output_path(filename, settings.ext, outdir) for filename in filenames
     ]
     for filename, output, output_path in zip(filenames, outputs, output_paths):
-        with open(output_path, "w") as f:
-            f.write(output)
+        try:
+            with open(output_path, "w", errors="replace") as f:
+                f.write(output)
+        except Exception as e:
+            print(f"Error writing {output_path}: {e}")
+            successful.discard(filename)
 
     successful = set(successful)
     format_errors = set()
