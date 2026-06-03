@@ -763,6 +763,23 @@ class RustTranspiler(CLikeTranspiler):
     def visit_Assert(self, node) -> str:
         return f"assert!({self.visit(node.test)});"
 
+    def _typename_from_value(self, node) -> str:
+        if isinstance(node, ast.Tuple):
+            tuple_types = [self._typename_from_value(e) for e in node.elts]
+            tuple_types = [t if t != "&str" else "&'static str" for t in tuple_types]
+            if tuple_types and all(t != self._default_type for t in tuple_types):
+                if len(tuple_types) == 1:
+                    return f"({tuple_types[0]},)"
+                return f"({', '.join(tuple_types)})"
+        typename = get_inferred_rust_type(node)
+        if typename == "&str":
+            return "&'static str"
+        if typename is not None:
+            return typename
+        if isinstance(node, ast.Constant) and node.value is None:
+            return "Option<()>"
+        return self._default_type
+
     def _compute_kw(self, node, target) -> str:
         kw = "let"
         mut = is_mutable(node.scopes, get_id(target))
@@ -823,7 +840,10 @@ class RustTranspiler(CLikeTranspiler):
             value = self.visit(node.value)
             if value is None:
                 value = "None"
-            return f"{target} = {value};"
+            assignment = f"{target} = {value};"
+            if is_global(node):
+                return f"pub fn __module_init_{node.lineno}() {{\n{assignment}\n}}"
+            return assignment
 
         definition = node.scopes.parent_scopes.find(get_id(target))
         if definition is None:
@@ -889,8 +909,12 @@ class RustTranspiler(CLikeTranspiler):
                 mut = "mut " if is_mutable(node.scopes, target_str) else ""
                 typename = f"&{mut}{typename}"
                 value = f"&{mut}{value}"
+            if typename == self._default_type and kw.startswith("pub "):
+                typename = self._typename_from_value(node.value)
             optional_typename = (
-                f": {typename}" if typename != self._default_type else ""
+                f": {typename}"
+                if typename != self._default_type or kw.startswith("pub ")
+                else ""
             )
             return f"{kw} {target_str}{optional_typename} = {value};"
 

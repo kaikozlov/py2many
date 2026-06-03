@@ -12,6 +12,7 @@ class DeclarationExtractor(ast.NodeVisitor):
         self.class_assignments = {}
         self.member_assignments = {}
         self.typed_function_args = {}
+        self._function_depth = 0
 
     def _maybe_rename_key(self, key):
         if key in self.transpiler._keywords:
@@ -81,7 +82,9 @@ class DeclarationExtractor(ast.NodeVisitor):
                 if names[i] not in self.typed_function_args:
                     self.typed_function_args[names[i]] = typename
 
+        self._function_depth += 1
         self.generic_visit(node)
+        self._function_depth -= 1
 
     def visit_AnnAssign(self, node, dataclass=False):
         target = node.target
@@ -99,7 +102,7 @@ class DeclarationExtractor(ast.NodeVisitor):
         if target_id not in self.annotated_members:
             self.annotated_members[target_id] = (type_str, node.value)
 
-        if not self.is_member(target):
+        if not self.is_member(target) and self._function_depth == 0:
             node.class_assignment = True
             if target not in self.class_assignments:
                 self.class_assignments[target] = node.value
@@ -114,7 +117,7 @@ class DeclarationExtractor(ast.NodeVisitor):
         if self.is_member(target):
             if target.attr not in self.member_assignments:
                 self.member_assignments[target.attr] = node.value
-        else:
+        elif self._function_depth == 0:
             node.class_assignment = True
             target = get_id(target)
             if target not in self.class_assignments:
@@ -122,7 +125,7 @@ class DeclarationExtractor(ast.NodeVisitor):
 
     def visit_With(self, node):
         for item in node.items:
-            if item.optional_vars:
+            if item.optional_vars and self._function_depth == 0:
                 target = get_id(item.optional_vars)
                 if target and target not in self.class_assignments:
                     self.class_assignments[target] = item.context_expr
