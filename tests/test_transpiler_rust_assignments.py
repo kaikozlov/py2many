@@ -880,7 +880,7 @@ def make(annotations):
     return IonAnnots(annotations)
 """)
 
-    assert "IonAnnots(annotations)" in generated
+    assert "IonAnnots::new(annotations)" in generated
     assert "IonAnnots{" not in generated
 
 
@@ -895,3 +895,97 @@ class Book:
 """)
 
     assert "pub tags: HashMap" in generated
+
+
+def test_defaultdict_emits_pylib_helper():
+    generated = rust_transpile("""
+from collections import defaultdict
+
+def make():
+    return defaultdict(list)
+""")
+
+    assert "defaultdict(|| Vec::new())" in generated
+    assert "collections.defaultdict" not in generated
+
+
+def test_re_sub_emits_regex_replace_helper():
+    generated = rust_transpile("""
+import re
+
+def clean(value):
+    return re.sub("[^A-Za-z]", "_", value)
+""")
+
+    assert "regex_replace(" in generated
+    assert "re.sub(" not in generated
+
+
+def test_module_level_type_alias_emits_pub_type():
+    generated = rust_transpile("""
+IonBool = bool
+IonNull = type(None)
+""")
+
+    assert "pub type IonBool = bool;" in generated
+    assert "pub type IonNull = ();" in generated
+
+
+def test_type_comparison_emits_python_type_eq():
+    generated = rust_transpile("""
+class Style:
+    pass
+
+def check(value):
+    if type(value) != Style:
+        return False
+    return True
+""")
+
+    assert "python_type_eq(" in generated
+    assert "r#type(" not in generated
+
+
+def test_isinstance_list_emits_instance_tag_helper():
+    generated = rust_transpile("""
+def check(value):
+    return isinstance(value, list)
+""")
+
+    assert 'is_instance_tag(&value as &dyn std::any::Any, "list")' in generated
+
+
+def test_getvalue_emits_single_call_without_double_parens():
+    generated = rust_transpile("""
+from io import BytesIO
+
+def read_buf(buf):
+    return buf.getvalue()
+""")
+
+    assert "buf.getvalue()" in generated
+    assert "getvalue()()" not in generated
+
+
+def test_ordered_dict_emits_index_map():
+    generated = rust_transpile("""
+import collections
+
+def make():
+    return collections.OrderedDict()
+""")
+
+    assert "IndexMap::new()" in generated
+    assert "collections.OrderedDict" not in generated
+
+
+def test_vec_truthiness_uses_is_empty():
+    generated = rust_transpile("""
+class YJ_Book:
+    def check(self):
+        if self.yj_containers:
+            return True
+        return False
+""")
+
+    assert ".is_empty()" in generated

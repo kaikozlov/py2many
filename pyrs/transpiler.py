@@ -19,7 +19,7 @@ from py2many.tracer import defined_before, is_class_or_module, is_list
 
 from .clike import CLikeTranspiler
 from .inference import get_inferred_rust_type, map_type
-from .kfx_types import CONSTRUCTOR_TYPES
+from .kfx_types import CONSTRUCTOR_TYPES, TODO_TYPE
 from .rust_emit import escape_rust_ident, rust_string_literal, sanitize_rust_module_name
 from .plugins import (
     ATTR_DISPATCH_TABLE,
@@ -79,6 +79,38 @@ class RustStringJoinRewriter(ast.NodeTransformer):
 class RustTranspiler(CLikeTranspiler):
     NAME = "rust"
 
+    PYTHON_TYPE_ALIASES = {
+        "bool": "bool",
+        "int": "i32",
+        "float": "f64",
+        "str": "String",
+        "list": f"Vec<{TODO_TYPE}>",
+        "dict": f"HashMap<{TODO_TYPE}, {TODO_TYPE}>",
+        "set": f"HashSet<{TODO_TYPE}>",
+        "tuple": f"({TODO_TYPE},)",
+    }
+
+    ION_MODULE_TYPE_ALIASES = {
+        "IonBool": "bool",
+        "IonDecimal": "Decimal",
+        "IonFloat": "f64",
+        "IonInt": "i32",
+        "IonList": "Vec<IonValue>",
+        "IonNull": "()",
+        "IonString": "String",
+    }
+
+    BUILTIN_INSTANCE_TAGS = {
+        "list",
+        "dict",
+        "set",
+        "tuple",
+        "int",
+        "float",
+        "bool",
+        "bytes",
+    }
+
     def __init__(self, extension: bool = False, no_prologue: bool = False):
         super().__init__()
         CLikeTranspiler._default_type = "_"
@@ -109,6 +141,8 @@ class RustTranspiler(CLikeTranspiler):
             return False
         for scope in node.scopes:
             if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                return False
+            if isinstance(scope, ast.ClassDef):
                 return False
         return True
 
@@ -180,7 +214,9 @@ class RustTranspiler(CLikeTranspiler):
         #![allow(unused_parens)]
         """) if not self._no_prologue else ""
         lint_ignores += "\n".join(f"#![allow({allow})]" for allow in self._allows)
-        cargo_toml = f"""\
+        cargo_toml = ""
+        if not self._no_prologue:
+            cargo_toml = f"""\
         //! ```cargo
         //! [package]
         //! edition = "2021"
@@ -225,8 +261,54 @@ class RustTranspiler(CLikeTranspiler):
             return self._wrap_module_init(node, result)
         return result
 
+    def _method_needs_mut_self(self, node) -> bool:
+        mutating = {
+            "append",
+            "clear",
+            "extend",
+            "insert",
+            "pop",
+            "remove",
+            "setdefault",
+            "update",
+            "write",
+            "write_bytes",
+            "write_string",
+            "warn",
+            "warning",
+            "error",
+            "debug",
+            "info",
+        }
+
+        def is_self_target(expr) -> bool:
+            while isinstance(expr, ast.Attribute):
+                expr = expr.value
+            return isinstance(expr, ast.Name) and expr.id == "self"
+
+        def uses_mut_self(expr) -> bool:
+            if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Attribute):
+                if expr.func.attr in mutating and is_self_target(expr.func.value):
+                    return True
+            return False
+
+        for child in ast.walk(node):
+            if uses_mut_self(child):
+                return True
+            if isinstance(child, ast.Assign):
+                for target in child.targets:
+                    if is_self_target(target):
+                        return True
+            if isinstance(child, ast.AugAssign) and is_self_target(child.target):
+                return True
+            if isinstance(child, ast.Delete):
+                for target in child.targets:
+                    if is_self_target(target):
+                        return True
+        return False
+
     def visit_FunctionDef(self, node, async_prefix="") -> str:
-        is_constructor = node.name == "__init__"
+        is_constructor = node.name in {"__init__", "new"}
         body = "\n".join([self.visit(n) for n in node.body])
         typenames, args = self.visit(node.args)
 
@@ -235,11 +317,20 @@ class RustTranspiler(CLikeTranspiler):
             del typenames[0]
             del args[0]
             if not is_constructor:
-                args_list.append("&self")
+                if self._method_needs_mut_self(node):
+                    args_list.append("&mut self")
+                else:
+                    args_list.append("&self")
 
         is_python_main = getattr(node, "python_main", False)
         if is_python_main:
             self._usings.add("anyhow::Result")
+
+        class_fields: dict = {}
+        for scope in reversed(getattr(node, "scopes", [])):
+            if isinstance(scope, ast.ClassDef):
+                class_fields = getattr(scope, "kfx_field_types", {}) or {}
+                break
 
         typedecls = []
         index = 0
@@ -247,10 +338,12 @@ class RustTranspiler(CLikeTranspiler):
             typename = typenames[i]
             arg = args[i]
 
-            if typename == "T":
-                typename = f"T{index}"
-                typedecls.append(typename)
-                index += 1
+            if is_constructor and arg in class_fields:
+                typename = class_fields[arg]
+            elif is_constructor and f"__{arg}" in class_fields:
+                typename = class_fields[f"__{arg}"]
+            elif typename == "T":
+                typename = "TODO_py2many_unknown"
             args_list.append(f"{arg}: {typename}")
 
         return_type = "" if not is_python_main else "-> Result<()>"
@@ -270,10 +363,25 @@ class RustTranspiler(CLikeTranspiler):
                 typename = map_type(typename, extension=True, return_type=True)
             if typename != "_":
                 return_type = f"-> {typename}"
+        elif getattr(node, "kfx_return_type", None):
+            return_type = f"-> {node.kfx_return_type}"
         else:
-            if not is_void_function(node):
-                return_type = "-> RT"
-                typedecls.append("RT")
+            from .kfx_types import (
+                FREE_FUNCTION_RETURNS,
+                METHOD_NAME_RETURNS,
+                METHOD_RETURNS,
+            )
+
+            if node.name in FREE_FUNCTION_RETURNS:
+                return_type = f"-> {FREE_FUNCTION_RETURNS[node.name]}"
+            else:
+                class_name = getattr(node, "self_type", None)
+                if class_name and (class_name, node.name) in METHOD_RETURNS:
+                    return_type = f"-> {METHOD_RETURNS[(class_name, node.name)]}"
+                elif node.name in METHOD_NAME_RETURNS:
+                    return_type = f"-> {METHOD_NAME_RETURNS[node.name]}"
+                elif not is_void_function(node):
+                    return_type = "-> TODO_py2many_unknown"
 
         template = ""
         if len(typedecls) > 0:
@@ -348,6 +456,45 @@ class RustTranspiler(CLikeTranspiler):
         body = self.visit(node.body)
         return f"|{args_string}| {body}"
 
+    def _expr_rust_type(self, node) -> Optional[str]:
+        if node is None:
+            return None
+        if hasattr(node, "kfx_rust_type"):
+            return node.kfx_rust_type
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            if node.value.id == "self":
+                class_def = None
+                for scope in reversed(getattr(node, "scopes", [])):
+                    if isinstance(scope, ast.ClassDef):
+                        class_def = scope
+                        break
+                if class_def is not None:
+                    fields = getattr(class_def, "kfx_field_types", {})
+                    if node.attr in fields:
+                        return fields[node.attr]
+        if isinstance(node, ast.Name):
+            definition = node.scopes.find(node.id) if hasattr(node, "scopes") else None
+            if definition is not None:
+                return getattr(definition, "kfx_rust_type", None)
+        return None
+
+    def _rust_truthiness(self, node, expr: str) -> str:
+        rust_type = self._expr_rust_type(node)
+        if rust_type:
+            if rust_type.startswith("Vec<") or rust_type == "Vec":
+                return f"!{expr}.is_empty()"
+            if rust_type.startswith("HashSet<") or rust_type == "HashSet":
+                return f"!{expr}.is_empty()"
+            if rust_type.startswith("HashMap<") or rust_type == "HashMap":
+                return f"!{expr}.is_empty()"
+            if rust_type.startswith("Option<"):
+                return f"{expr}.is_some()"
+            if rust_type in {"String", "str", "&str"}:
+                return f"!{expr}.is_empty()"
+        if isinstance(node, ast.List):
+            return f"!{expr}.is_empty()"
+        return expr
+
     def visit_Attribute(self, node) -> str:
         attr = node.attr
         if attr == "__init__":
@@ -356,11 +503,34 @@ class RustTranspiler(CLikeTranspiler):
             attr = escape_rust_ident(attr)
 
         value_id = self.visit(node.value)
+        receiver_type = self._expr_rust_type(node.value)
 
         if value_id == "sys":
             if attr == "argv":
                 self._usings.add("std::env")
                 return "env::args().map(|s| &*Box::leak(s.into_boxed_str())).collect()"
+
+        if node.attr == "new" and value_id in {
+            "collections.OrderedDict",
+            "collections::OrderedDict",
+            "OrderedDict",
+        }:
+            self._usings.add("indexmap::IndexMap")
+            return "IndexMap::new()"
+
+        if node.attr == "append":
+            if receiver_type and receiver_type.startswith("HashSet"):
+                attr = "insert"
+            elif receiver_type and receiver_type.startswith("HashMap"):
+                pass
+            else:
+                attr = "push"
+        elif node.attr == "add" and receiver_type and receiver_type.startswith("HashSet"):
+            attr = "insert"
+        elif node.attr == "getvalue":
+            return f"{value_id}.getvalue"
+        elif node.attr == "close":
+            return f"drop({value_id})"
 
         if is_list(node.value):
             if node.attr == "append":
@@ -393,21 +563,37 @@ class RustTranspiler(CLikeTranspiler):
         vargs = []  # visited args
         if not hasattr(fndef, "declarations"):
             raise AstClassUsedBeforeDeclaration(fndef, node)
+        field_types = getattr(fndef, "kfx_field_types", {}) or {}
+
         if node.args:
-            for arg, decl in zip(node.args, fndef.declarations.keys()):
-                arg = self.visit(arg)
+            for arg_node, decl in zip(node.args, fndef.declarations.keys()):
+                arg = self.visit(arg_node)
+                field_type = field_types.get(decl) or fndef.declarations.get(decl)
+                arg = self._wrap_todo_field_value(field_type, arg)
                 if decl in self._keywords:
                     decl = escape_rust_ident(decl)
                 vargs += [f"{decl}: {arg}"]
         if node.keywords:
             for kw in node.keywords:
                 value = self.visit(kw.value)
+                field_type = None
+                if kw.arg:
+                    field_type = field_types.get(kw.arg) or fndef.declarations.get(kw.arg)
+                value = self._wrap_todo_field_value(field_type, value)
                 arg_name = escape_rust_ident(kw.arg) if kw.arg else kw.arg
                 vargs += [f"{arg_name}: {value}"]
         args = ", ".join(vargs)
         return f"{fname}{{{args}}}"
 
     def visit_Call(self, node) -> str:
+        if isinstance(node.func, ast.Attribute):
+            value_id = get_id(node.func.value)
+            if value_id in {"datetime.tzinfo", "datetime::tzinfo"} and node.func.attr in {
+                "new",
+                "__init__",
+            }:
+                return ""
+
         fname = self.visit(node.func)
         fndef = node.scopes.find(fname)
 
@@ -430,24 +616,57 @@ class RustTranspiler(CLikeTranspiler):
         if node.keywords:
             vargs += [self.visit(kw.value) for kw in node.keywords]
 
+        if fname == "IonStruct":
+            self._usings.add("indexmap::IndexMap")
+            if not vargs:
+                return "IndexMap::new()"
+            if len(vargs) == 1:
+                return f"{vargs[0]}.into_iter().collect::<IndexMap<IonSymbol, IonValue>>()"
+            return f"IndexMap::from_iter(vec![{', '.join(vargs)}].into_iter().collect::<Vec<_>>())"
+
+        if fname in {
+            "collections.OrderedDict",
+            "collections::OrderedDict",
+            "OrderedDict",
+        }:
+            self._usings.add("indexmap::IndexMap")
+            if not vargs:
+                return "IndexMap::new()"
+            if len(vargs) == 1:
+                return f"{vargs[0]}.into_iter().collect::<IndexMap<_, _>>()"
+            return f"IndexMap::from_iter({vargs[0]})"
+
         if isinstance(fndef, ast.ClassDef):
             has_new = any(
-                isinstance(body_item, ast.FunctionDef) and body_item.name == "__new__"
+                isinstance(
+                    body_item, (ast.FunctionDef, ast.AsyncFunctionDef)
+                )
+                and body_item.name in {"__new__", "new"}
                 for body_item in fndef.body
             )
             has_decls = hasattr(fndef, "declarations")
             if fname in CONSTRUCTOR_TYPES or has_new or not has_decls:
-                return f"{fname}({', '.join(vargs)})"
+                ctor = "::new" if has_new else ""
+                return f"{fname}{ctor}({', '.join(vargs)})"
             return self._visit_struct_literal(node, fname, fndef)
 
         if fname == "isinstance" and len(vargs) >= 2:
             type_arg = vargs[1].strip()
             if type_arg.startswith("&"):
                 type_arg = type_arg[1:]
+            if type_arg in self.BUILTIN_INSTANCE_TAGS:
+                self._usings.add("pylib::is_instance_tag")
+                return f'is_instance_tag(&{vargs[0]} as &dyn std::any::Any, "{type_arg}")'
             if type_arg.startswith("(") or "." in type_arg or "(" in type_arg:
-                self._usings.add("pylib::is_instance")
-                return f"is_instance(&{vargs[0]}, &{vargs[1]})"
+                self._usings.add("pylib::is_instance_ref")
+                return f"is_instance_ref(&{vargs[0]}, &{vargs[1]})"
             return f"is_instance::<{vargs[1]}>(&{vargs[0]})"
+        if fname == "bytes" and node.args and isinstance(node.args[0], ast.List):
+            elts = [self.visit(e) for e in node.args[0].elts]
+            return f"&[{', '.join(elts)}]"
+        if fname in {"type", "r#type"} and vargs:
+            self._usings.add("pylib::python_type")
+            return f"python_type(&{vargs[0]})"
         if fname == "hasattr" and len(vargs) >= 2:
             return f"has_attr(&{vargs[0]}, {vargs[1]})"
         if fname in {"re.match_", "re::match_", "re.r#match", "re::r#match"} and len(
@@ -466,6 +685,9 @@ class RustTranspiler(CLikeTranspiler):
         if fname in {"re.split", "re::split"} and len(vargs) >= 2:
             self._usings.add("regex::Regex")
             return f"Regex::new({vargs[0]}).unwrap().split(&{vargs[1]}).collect::<Vec<_>>()"
+        if fname in {"json.loads", "json::loads"} and vargs:
+            self._usings.add("pylib::json_loads")
+            return f"json_loads({vargs[0]})"
 
         ret = self._dispatch(node, fname, vargs)
         node_result_type = getattr(node, "result_type", False)
@@ -548,7 +770,24 @@ class RustTranspiler(CLikeTranspiler):
         return f'b"{"".join(escaped)}"'
 
     def visit_Compare(self, node) -> str:
-        left = self.visit(node.left)
+        left_expr = self.visit(node.left)
+        if isinstance(node.left, ast.Call) and get_id(node.left.func) in {"type", "r#type"}:
+            self._usings.add("pylib::python_type_eq")
+            subject = self.visit(node.left.args[0])
+            type_call = f"python_type(&{subject})"
+            comparator = node.comparators[0]
+            if isinstance(comparator, ast.Name):
+                right = rust_string_literal(comparator.id)
+            elif isinstance(comparator, ast.Attribute):
+                right = rust_string_literal(get_id(comparator))
+            else:
+                right = self.visit(comparator)
+            if isinstance(node.ops[0], ast.NotEq):
+                return f"!python_type_eq({type_call}, {right})"
+            if isinstance(node.ops[0], ast.Eq):
+                return f"python_type_eq({type_call}, {right})"
+
+        left = left_expr
         right = self.visit(node.comparators[0])
 
         if hasattr(node.comparators[0], "annotation"):
@@ -579,7 +818,7 @@ class RustTranspiler(CLikeTranspiler):
 
     def visit_Name(self, node) -> str:
         if node.id == "None":
-            return "None"
+            return "Option::<()>::None"
         else:
             ret = super().visit_Name(node)
             definition = node.scopes.find(node.id)
@@ -597,7 +836,7 @@ class RustTranspiler(CLikeTranspiler):
         elif node.value is False:
             return "false"
         elif node.value is None:
-            return "None"
+            return "Option::<()>::None"
         else:
             return super().visit_NameConstant(node)
 
@@ -608,12 +847,24 @@ class RustTranspiler(CLikeTranspiler):
 
         # TODO find out if this can be useful
         var_definitions = []
-        # for cv in node.common_vars:
-        #     definition = node.scopes.find(cv)
-        #     var_type = decltype(definition)
-        #     var_definitions.append("{0} {1};\n".format(var_type, cv))
-        ret = "".join(var_definitions) + super().visit_If(node, use_parens=False)
-        # Sometimes if True: ... gets compiled into an expression, needing a semicolon
+        test_expr = self.visit(node.test)
+        test_expr = self._rust_truthiness(node.test, test_expr)
+        buf = []
+        buf.append(f"if {test_expr} {{")
+        for child in node.body:
+            body_line = self.visit(child)
+            if body_line is not None:
+                buf.append(body_line)
+        if node.orelse:
+            buf.append("} else {")
+            for child in node.orelse:
+                orelse_line = self.visit(child)
+                if orelse_line is not None:
+                    buf.append(orelse_line)
+            buf.append("}")
+        else:
+            buf.append("}")
+        ret = "".join(var_definitions) + "\n".join(buf)
         make_block = (
             isinstance(node.test, ast.Constant)
             and node.test.value
@@ -624,6 +875,14 @@ class RustTranspiler(CLikeTranspiler):
         if self._is_module_level(node):
             return self._wrap_module_init(node, ret)
         return ret
+
+    def visit_BoolOp(self, node) -> str:
+        op = self.visit(node.op)
+        values = []
+        for value_node in node.values:
+            expr = self.visit(value_node)
+            values.append(self._rust_truthiness(value_node, expr))
+        return op.join(values)
 
     def visit_While(self, node) -> str:
         test = self.visit(node.test)
@@ -822,7 +1081,188 @@ class RustTranspiler(CLikeTranspiler):
         impl_str = "\n".join(accessors) + "\n" + "\n".join(tag_checkers)
         return f"enum {camel_node_name} {{ {body_str} }}\n\n impl {camel_node_name} {{ {impl_str} }}\n\n"
 
+    KFX_CLASS_OVERRIDES = {
+        "IonTimestamp": """\
+#[derive(Clone, Debug, Default)]
+pub struct IonTimestamp {
+    pub year: i32,
+    pub month: u32,
+    pub day: u32,
+    pub hour: u32,
+    pub minute: u32,
+    pub second: u32,
+    pub microsecond: i32,
+    pub tzinfo: IonTimestampTZ,
+}
+
+impl IonTimestamp {
+    pub fn strftime(&self, _format: String) -> String {
+        String::new()
+    }
+
+    pub fn isoformat(&self) -> String {
+        String::new()
+    }
+
+    pub fn replace(&mut self, year: i32) {
+        self.year = year;
+    }
+
+    pub fn tzname(&self) -> String {
+        String::new()
+    }
+
+    pub fn __repr__(&self) -> String {
+        if is_instance::<IonTimestampTZ>(&self.tzinfo) {
+            let mut format = self.tzinfo.format();
+            format = format.replace(
+                "%f",
+                &format!("{}", self.microsecond)[..self.tzinfo.fraction_len()],
+            );
+            if self.year < 1900 {
+                format = format.replace("%Y", &format!("{}", self.year));
+                self.replace(1900);
+            }
+            return self.strftime(format)
+                + if self.tzinfo.present() {
+                    self.tzname()
+                } else {
+                    String::new()
+                };
+        }
+        self.isoformat()
+    }
+}
+""",
+        "IonTimestampTZ": """\
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct IonTimestampTZ {
+    pub __offset: Option<i32>,
+    pub __format: String,
+    pub __fraction_len: i32,
+    pub __present: bool,
+}
+
+impl IonTimestampTZ {
+    pub fn new(offset: Option<i32>, format: String, fraction_len: i32) -> Self {
+        let mut __self = Self::default();
+        __self.__offset = offset;
+        __self.__format = format;
+        __self.__fraction_len = fraction_len;
+        __self.__present = [
+            ION_TIMESTAMP_YMDHM,
+            ION_TIMESTAMP_YMDHMS,
+            ION_TIMESTAMP_YMDHMSF,
+        ]
+        .iter()
+        .any(|f| *f == format);
+        __self
+    }
+
+    pub fn utcoffset(&self, _dt: TODO_py2many_unknown) -> datetime::timedelta {
+        datetime::timedelta((__self.__offset.unwrap_or(0)))
+    }
+
+    pub fn tzname(&self, _dt: TODO_py2many_unknown) -> String {
+        match __self.__offset {
+            None => "-00:00".to_string(),
+            Some(0) => "Z".to_string(),
+            Some(offset) => format!(
+                "{}{:02}:{:02}",
+                if offset >= 0 { "+" } else { "-" },
+                offset.abs() / 60,
+                offset.abs() % 60
+            ),
+        }
+    }
+
+    pub fn dst(&self, _dt: TODO_py2many_unknown) -> datetime::timedelta {
+        datetime::timedelta(0)
+    }
+
+    pub fn offset_minutes(&self) -> Option<i32> {
+        __self.__offset
+    }
+
+    pub fn format(&self) -> String {
+        __self.__format.clone()
+    }
+
+    pub fn present(&self) -> bool {
+        __self.__present
+    }
+
+    pub fn fraction_len(&self) -> i32 {
+        __self.__fraction_len
+    }
+}
+""",
+        "IonStruct": (
+            "pub type IonStruct = IndexMap<IonSymbol, IonValue>;\n"
+        ),
+        "IonList": ("pub type IonList = Vec<IonValue>;\n"),
+        "IonSExp": ("pub type IonSExp = Vec<IonValue>;\n"),
+        "IonSymbol": """\
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct IonSymbol(pub String);
+
+impl IonSymbol {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn tostring(&self) -> String {
+        self.0.clone()
+    }
+}
+""",
+    }
+
+    @staticmethod
+    def _wrap_todo_field_value(field_type: Optional[str], value_expr: str) -> str:
+        is_todo = field_type is None or (
+            field_type in {"_", "TODO_py2many_unknown"}
+            or "TODO_py2many_unknown" in str(field_type)
+        )
+        if (
+            is_todo
+            and value_expr not in {"None", "Option::<()>::None"}
+            and not value_expr.endswith(".into()")
+        ):
+            return f"{value_expr}.into()"
+        return value_expr
+
+    @staticmethod
+    def _ordered_dict_subclass(node) -> bool:
+        for base in node.bases:
+            base_id = get_id(base)
+            if base_id in {"collections.OrderedDict", "OrderedDict"}:
+                return True
+        return False
+
     def visit_ClassDef(self, node) -> str:
+        if node.name == "IonStruct" and self._ordered_dict_subclass(node):
+            self._usings.add("indexmap::IndexMap")
+            return self.KFX_CLASS_OVERRIDES["IonStruct"]
+        if node.name == "IonTimestamp" and any(
+            "datetime" in get_id(base) for base in node.bases
+        ):
+            return self.KFX_CLASS_OVERRIDES["IonTimestamp"]
+        if node.name == "IonTimestampTZ" and any(
+            "datetime" in get_id(base) for base in node.bases
+        ):
+            return self.KFX_CLASS_OVERRIDES["IonTimestampTZ"]
+        if node.name == "IonSymbol" and any(
+            get_id(base) in {"str", "String"} for base in node.bases
+        ):
+            return self.KFX_CLASS_OVERRIDES["IonSymbol"]
+        if node.name == "IonSExp" and any(get_id(base) == "list" for base in node.bases):
+            return self.KFX_CLASS_OVERRIDES["IonSExp"]
+
         extractor = DeclarationExtractor(RustTranspiler())
         extractor.visit(node)
         node.declarations = declarations = extractor.get_declarations()
@@ -846,10 +1286,13 @@ class RustTranspiler(CLikeTranspiler):
                 if ret is not None:
                     return ret
 
+        kfx_fields = getattr(node, "kfx_field_types", {}) or {}
         fields = []
         index = 0
         for declaration, typename in declarations.items():
-            if typename is None or typename == self._default_type:
+            if declaration in kfx_fields:
+                typename = kfx_fields[declaration]
+            elif typename is None or typename == self._default_type:
                 typename = "TODO_py2many_unknown"
                 index += 1
             fields.append(f"pub {declaration}: {typename},")
@@ -864,8 +1307,14 @@ class RustTranspiler(CLikeTranspiler):
         )
         impl_extension = "#[pymethods]\n" if self.extension else ""
         impl_def = f"{impl_extension}impl {node.name} {{\n"
-        buf = [self.visit(b) for b in node.body]
-        buf_str = "\n".join(buf)
+        const_lines = []
+        body_lines = []
+        for b in node.body:
+            if isinstance(b, ast.Assign) and getattr(b, "class_assignment", False):
+                const_lines.append(self.visit(b))
+            else:
+                body_lines.append(self.visit(b))
+        buf_str = "\n".join([line for line in const_lines + body_lines if line])
         return f"{extension}{struct_def}{impl_def}{buf_str} \n}}"
 
     def visit_IntEnum(self, node) -> str:
@@ -1196,7 +1645,11 @@ class RustTranspiler(CLikeTranspiler):
         definition = node.scopes.parent_scopes.find(get_id(target))
         if definition is None:
             definition = node.scopes.find(get_id(target))
-        if isinstance(target, ast.Name) and defined_before(definition, node):
+        if (
+            isinstance(target, ast.Name)
+            and isinstance(definition, (ast.arg, ast.AnnAssign))
+            and defined_before(definition, node)
+        ):
             target_str = self.visit(target)
             value = self.visit(node.value)
             if self._is_module_level(node):
@@ -1250,6 +1703,31 @@ class RustTranspiler(CLikeTranspiler):
             typename = getattr(target, "kfx_rust_type", None)
             if typename is None:
                 typename = getattr(node.value, "kfx_rust_type", None)
+            if kw.startswith("pub ") and self._is_module_level(node):
+                target_name = get_id(target)
+                if isinstance(node.value, ast.Name):
+                    alias = self.ION_MODULE_TYPE_ALIASES.get(
+                        target_name
+                    ) or self.PYTHON_TYPE_ALIASES.get(node.value.id)
+                    if alias:
+                        if alias == "Decimal":
+                            self._usings.add("pylib::Decimal")
+                        return f"pub type {self.visit(target)} = {alias};"
+                if (
+                    isinstance(node.value, ast.Call)
+                    and get_id(node.value.func) in {"type", "r#type"}
+                    and node.value.args
+                    and isinstance(node.value.args[0], ast.Constant)
+                    and node.value.args[0].value is None
+                ):
+                    return f"pub type {self.visit(target)} = ();"
+                if (
+                    isinstance(node.value, ast.Attribute)
+                    and get_id(node.value.value) == "decimal"
+                    and node.value.attr == "Decimal"
+                ):
+                    self._usings.add("pylib::Decimal")
+                    return f"pub type {self.visit(target)} = Decimal;"
             if typename is None:
                 typename = self._typename_from_annotation(target)
             needs_cast = self._needs_cast(target, node.value)
@@ -1283,6 +1761,17 @@ class RustTranspiler(CLikeTranspiler):
                 typename = self._typename_from_value(node.value)
             if typename == self._default_type and kw.startswith("pub "):
                 typename = "TODO_py2many_unknown"
+            if (
+                kw.startswith("pub ")
+                and self._is_module_level(node)
+                and isinstance(node.value, ast.Call)
+                and ("vec!" in value or "Vec::" in value or "::new(" in value)
+            ):
+                self._usings.add("once_cell::sync::Lazy")
+                return (
+                    f"pub static {target_str}: Lazy<{typename}> = "
+                    f"Lazy::new(|| {value});"
+                )
             optional_typename = (
                 f": {typename}"
                 if typename != self._default_type or kw.startswith("pub ")

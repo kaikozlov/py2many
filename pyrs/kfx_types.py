@@ -42,6 +42,18 @@ CONSTRUCTOR_TYPES = {
     "YJFragmentKey": "YJFragmentKey",
     "YJFragmentList": "YJFragmentList",
     "ZipUnpackContainer": "ZipUnpackContainer",
+    "Style": "Style",
+    "ImgPlane": "ImgPlane",
+    "OutputFile": "OutputFile",
+    "KfxEpubResource": "KfxEpubResource",
+    "BookPart": "BookPart",
+    "GuideEntry": "GuideEntry",
+    "ManifestEntry": "ManifestEntry",
+    "TocEntry": "TocEntry",
+    "PageMapEntry": "PageMapEntry",
+    "JxrImage": "JxrImage",
+    "JxrMisc": "JxrMisc",
+    "JxrContainer": "JxrContainer",
 }
 
 
@@ -54,6 +66,15 @@ METHOD_RETURNS = {
     ("IonText", "deserialize_single_value"): "IonValue",
     ("IonText", "deserialize_annotated_value"): "IonAnnotation",
     ("IonText", "deserialize_multiple_values"): "Vec<IonValue>",
+    ("IonText", "serialize_multiple_values"): "Vec<u8>",
+    ("IonText", "serialize_single_value"): "Vec<u8>",
+    ("IonSerial", "serialize_single_value"): "Vec<u8>",
+    ("IonSerial", "serialize_multiple_values"): "Vec<u8>",
+    ("IonBinary", "serialize_single_value"): "Vec<u8>",
+    ("IonBinary", "serialize_multiple_values"): "Vec<u8>",
+    ("IonBinary", "deserialize_multiple_values"): "Vec<IonValue>",
+    ("Token", "classify"): "String",
+    ("Token", "__repr__"): "String",
     ("KfxContainerEntity", "deserialize"): "YJFragment",
     ("LocalSymbolTable", "create_import"): "Option<IonAnnotation>",
     ("LocalSymbolTable", "create_local_symbol"): "IonSymbol",
@@ -86,6 +107,10 @@ METHOD_RETURNS = {
 }
 
 METHOD_NAME_RETURNS = {
+    "classify": "String",
+    "serialize": "Vec<u8>",
+    "serialize_multiple_values": "Vec<u8>",
+    "serialize_single_value": "Vec<u8>",
     "create_import": "Option<IonAnnotation>",
     "create_local_symbol": "IonSymbol",
     "deserialize_annotated_value": "IonAnnotation",
@@ -102,6 +127,27 @@ FREE_FUNCTION_RETURNS = {
     "filtered_IonList": "Vec<IonValue>",
     "ion_type": "IonDataType",
     "unannotated": "IonValue",
+}
+
+ION_TYPE_ALIASES = {
+    "IonBool": "bool",
+    "IonDecimal": "Decimal",
+    "IonFloat": "f64",
+    "IonInt": "i32",
+    "IonList": "Vec<IonValue>",
+    "IonNull": "()",
+    "IonString": "String",
+    "IonStruct": "IndexMap<IonSymbol, IonValue>",
+    "IonSymbol": "IonSymbol",
+    "IonValue": "IonValue",
+    "IonDataType": "IonDataType",
+    "IonAnnotation": "IonAnnotation",
+    "IonAnnots": "IonAnnots",
+    "IonBLOB": "IonBLOB",
+    "IonCLOB": "IonCLOB",
+    "IonSExp": "Vec<IonValue>",
+    "IonTimestamp": "IonTimestamp",
+    "IonNop": "IonNop",
 }
 
 ION_TYPE_NAMES = {
@@ -201,6 +247,34 @@ CLASS_FIELD_TYPES = {
         "annotations": "IonAnnots",
         "value": "IonValue",
     },
+    "IonSerial": {
+        "symtab": "Option<LocalSymbolTable>",
+    },
+    "IonText": {
+        "symtab": "Option<LocalSymbolTable>",
+        "indent": "i32",
+        "file": "Option<TODO_py2many_unknown>",
+        "allow_operators": "i32",
+        "allow_unicode_strings": "bool",
+    },
+    "IonTimestampTZ": {
+        "__offset": "Option<i32>",
+        "__format": "String",
+        "__fraction_len": "i32",
+        "__present": "bool",
+    },
+    "Token": {
+        "text": "String",
+        "line_number": "i32",
+        "start_col": "i32",
+        "ttype": "String",
+    },
+    "Deserializer": {
+        "symtab": "Option<LocalSymbolTable>",
+    },
+    "Serializer": {
+        "symtab": "Option<LocalSymbolTable>",
+    },
     "IonStruct": {},
     "IonSExp": {},
     "KFX_EPUB": {
@@ -227,6 +301,49 @@ CLASS_FIELD_TYPES = {
         "ncx_toc": "Vec<TocEntry>",
         "oebps_files": "HashMap<String, OutputFile>",
         "pagemap": "Vec<PageMapEntry>",
+    },
+    "Style": {
+        "properties": "HashMap<String, String>",
+    },
+    "ImgPlane": {
+        "w": "i32",
+        "h": "i32",
+        "data": "Vec<u8>",
+    },
+    "OutputFile": {
+        "data": "Vec<u8>",
+        "media_type": "String",
+    },
+    "KfxEpubResource": {
+        "data": "Vec<u8>",
+        "media_type": "String",
+    },
+    "IonSharedSymbolTable": {
+        "name": "String",
+        "version": "i32",
+        "symbols": "Vec<String>",
+    },
+    "SymbolTableCatalog": {
+        "shared_symbol_tables": "HashMap<(String, i32), IonSharedSymbolTable>",
+    },
+    "LocalSymbolTable": {
+        "symbols": "Vec<Option<IonSymbol>>",
+        "id_of_symbol": "HashMap<IonSymbol, i32>",
+        "symbol_of_id": "HashMap<i32, IonSymbol>",
+        "local_min_id": "i32",
+        "imports": "Vec<SymbolTableImport>",
+        "max_id": "i32",
+    },
+    "Serializer": {
+        "output": "Vec<u8>",
+    },
+    "Deserializer": {
+        "data": "Vec<u8>",
+    },
+    "JxrImage": {
+        "planes": "Vec<ImgPlane>",
+        "width": "i32",
+        "height": "i32",
     },
 }
 
@@ -517,10 +634,30 @@ class KfxRustTypeResolver(ast.NodeTransformer):
         node.kfx_field_types = fields
         return node
 
+    def _infer_function_return_type(self, node: ast.FunctionDef) -> Optional[str]:
+        return_types = []
+        for child in ast.walk(node):
+            if isinstance(child, ast.Return) and child.value is not None:
+                rust_type = getattr(child.value, "kfx_rust_type", None) or self._type_of_expr(
+                    child.value
+                )
+                if rust_type:
+                    return_types.append(rust_type)
+        if not return_types:
+            return None
+        if all(t == return_types[0] for t in return_types):
+            return return_types[0]
+        if all(t in {"String", "&str"} for t in return_types):
+            return "String"
+        return return_types[0]
+
     def visit_FunctionDef(self, node):
         self._ion_type_sources_stack.append({})
         self.generic_visit(node)
         self._ion_type_sources_stack.pop()
+        inferred = self._infer_function_return_type(node)
+        if inferred:
+            node.kfx_return_type = inferred
         return node
 
     def visit_Assign(self, node):
@@ -547,6 +684,12 @@ class KfxRustTypeResolver(ast.NodeTransformer):
             if ion_source:
                 self._record_ion_type_source(target.id, ion_source)
 
+        return node
+
+    def visit_Return(self, node):
+        self.generic_visit(node)
+        if node.value is not None:
+            _set_rust_type(node.value, self._type_of_expr(node.value))
         return node
 
     def visit_Call(self, node):

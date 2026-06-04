@@ -166,6 +166,63 @@ class RustTranspilerPlugins:
         self._usings.add("pylib::PdfReader")
         return f"PdfReader::new({', '.join(vargs)})"
 
+    def visit_defaultdict(self, node, vargs: List[str]) -> str:
+        self._usings.add("pylib::defaultdict")
+        if not vargs:
+            return "defaultdict(|| std::collections::HashMap::new())"
+        factory = vargs[0]
+        factory_map = {
+            "list": "|| Vec::new()",
+            "dict": "|| std::collections::HashMap::new()",
+            "set": "|| std::collections::HashSet::new()",
+            "int": "|| 0",
+        }
+        if factory in factory_map:
+            return f"defaultdict({factory_map[factory]})"
+        return f"defaultdict({factory})"
+
+    def visit_re_sub(self, node, vargs: List[str]) -> str:
+        self._usings.add("pylib::regex_replace")
+        if len(vargs) >= 3:
+            return f"regex_replace({vargs[0]}, {vargs[1]}, {vargs[2]})"
+        raise Exception(f"re.sub expected 3 args, got {vargs}")
+
+    def visit_re_subn(self, node, vargs: List[str]) -> str:
+        self._usings.add("pylib::regex_subn")
+        if len(vargs) >= 3:
+            return f"regex_subn({vargs[0]}, {vargs[1]}, {vargs[2]})"
+        raise Exception(f"re.subn expected 3 args, got {vargs}")
+
+    @staticmethod
+    def visit_dict_ctor(node, vargs: List[str]) -> str:
+        if not vargs:
+            return "std::collections::HashMap::new()"
+        if len(vargs) == 1:
+            return f"{vargs[0]}.into_iter().collect()"
+        return f"dict_new([{', '.join(vargs)}])"
+
+    @staticmethod
+    def visit_list_ctor(node, vargs: List[str]) -> str:
+        if not vargs:
+            return "Vec::new()"
+        if len(vargs) == 1:
+            return f"{vargs[0]}.into_iter().collect::<Vec<_>>()"
+        return f"vec![{', '.join(vargs)}]"
+
+    @staticmethod
+    def visit_set_ctor(node, vargs: List[str]) -> str:
+        if not vargs:
+            return "std::collections::HashSet::new()"
+        if len(vargs) == 1:
+            return f"{vargs[0]}.into_iter().collect::<std::collections::HashSet<_>>()"
+        return f"set_new([{', '.join(vargs)}])"
+
+    @staticmethod
+    def visit_python_type(node, vargs: List[str]) -> str:
+        if vargs:
+            return f"python_type(&{vargs[0]})"
+        return "python_type(&())"
+
     def visit_print(self, node, vargs: List[str]) -> str:
         placeholders = []
         for n in node.args:
@@ -227,7 +284,10 @@ SMALL_DISPATCH_MAP = {
     "reversed": lambda n, vargs: f"{vargs[0]}.iter().rev()",
     "map": lambda n, vargs: f"{vargs[1]}.iter().map({vargs[0]})",
     "filter": lambda n, vargs: f"{vargs[1]}.into_iter().filter({vargs[0]})",
-    "list": lambda n, vargs: f"{vargs[0]}.collect::<Vec<_>>()",
+    "list": lambda n, vargs: RustTranspilerPlugins.visit_list_ctor(n, vargs),
+    "dict": lambda n, vargs: RustTranspilerPlugins.visit_dict_ctor(n, vargs),
+    "set": lambda n, vargs: RustTranspilerPlugins.visit_set_ctor(n, vargs),
+    "type": lambda n, vargs: RustTranspilerPlugins.visit_python_type(n, vargs),
     "asyncio.run": RustTranspilerPlugins.visit_asyncio_run,
     **FIXED_SIZE_INT_MAP,
 }
@@ -243,6 +303,13 @@ DISPATCH_MAP = {
     "range": RustTranspilerPlugins.visit_range,
     "xrange": RustTranspilerPlugins.visit_range,
     "print": RustTranspilerPlugins.visit_print,
+    "re.sub": RustTranspilerPlugins.visit_re_sub,
+    "re::sub": RustTranspilerPlugins.visit_re_sub,
+    "collections.defaultdict": RustTranspilerPlugins.visit_defaultdict,
+    "collections::defaultdict": RustTranspilerPlugins.visit_defaultdict,
+    "defaultdict": RustTranspilerPlugins.visit_defaultdict,
+    "re.subn": RustTranspilerPlugins.visit_re_subn,
+    "re::subn": RustTranspilerPlugins.visit_re_subn,
 }
 
 MODULE_DISPATCH_TABLE = {
