@@ -160,6 +160,7 @@ ION_TYPE_NAMES = {
     "IonInt",
     "IonList",
     "IonNop",
+    "IonNull",
     "IonSExp",
     "IonString",
     "IonStruct",

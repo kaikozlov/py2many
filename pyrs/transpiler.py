@@ -19,7 +19,7 @@ from py2many.tracer import defined_before, is_class_or_module, is_list
 
 from .clike import CLikeTranspiler
 from .inference import get_inferred_rust_type, map_type
-from .kfx_types import CONSTRUCTOR_TYPES, TODO_TYPE
+from .kfx_types import CLASS_FIELD_TYPES, CONSTRUCTOR_TYPES, ION_TYPE_NAMES, TODO_TYPE
 from .rust_emit import escape_rust_ident, rust_string_literal, sanitize_rust_module_name
 from .plugins import (
     ATTR_DISPATCH_TABLE,
@@ -126,6 +126,9 @@ class RustTranspiler(CLikeTranspiler):
         self._allows = set()
         self._rust_mods = set()
         self._available_local_mods: set[str] = set()
+        self._class_hoisted_assignments: dict[str, set[str]] = {}
+        self._class_static_context: tuple[str, set[str], set[str]] | None = None
+        self._ion_type_value_context = 0
 
     def set_available_local_mods(self, module_names: set[str]) -> None:
         self._available_local_mods = module_names
@@ -135,6 +138,36 @@ class RustTranspiler(CLikeTranspiler):
         super()._reset()
         self._available_local_mods = available
         self._rust_mods = set()
+        self._class_hoisted_assignments = {}
+        self._class_static_context = None
+        self._ion_type_value_context = 0
+
+    ION_DATA_TYPE_ENUM = """\
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum IonDataType {
+    IonAnnotation,
+    IonBool,
+    IonBLOB,
+    IonCLOB,
+    IonDecimal,
+    IonFloat,
+    IonInt,
+    IonList,
+    IonNull,
+    IonNop,
+    IonSExp,
+    IonString,
+    IonStruct,
+    IonSymbol,
+    IonTimestamp,
+}
+"""
+
+    def visit_Module(self, node) -> str:
+        body = super().visit_Module(node)
+        if getattr(self, "_module", None) == "ion" and "pub enum IonDataType" not in body:
+            body = f"{self.ION_DATA_TYPE_ENUM}\n{body}"
+        return body
 
     def _is_module_level(self, node) -> bool:
         if not hasattr(node, "scopes"):
@@ -427,7 +460,10 @@ class RustTranspiler(CLikeTranspiler):
                 fndef = scope
                 break
         if node.value:
-            ret = self.visit(node.value)
+            if isinstance(node.value, ast.Name) and node.value.id in ION_TYPE_NAMES:
+                ret = self._visit_as_ion_type_value(node.value)
+            else:
+                ret = self.visit(node.value)
             if fndef:
                 if getattr(fndef, "rust_pyresult_type", False):
                     # TODO: Design a more robust solution for this
@@ -538,6 +574,13 @@ class RustTranspiler(CLikeTranspiler):
         if not value_id:
             value_id = ""
 
+        if value_id in self._class_hoisted_assignments:
+            if attr in self._class_hoisted_assignments[value_id]:
+                return attr
+
+        if value_id == "log":
+            return f"{value_id}.{attr}"
+
         if is_class_or_module(value_id, node.scopes):
             return f"{value_id}::{attr}"
 
@@ -560,15 +603,27 @@ class RustTranspiler(CLikeTranspiler):
             return ("", splits[0])
 
     def _visit_struct_literal(self, node, fname: str, fndef: ast.ClassDef) -> str:
-        vargs = []  # visited args
         if not hasattr(fndef, "declarations"):
             raise AstClassUsedBeforeDeclaration(fndef, node)
         field_types = getattr(fndef, "kfx_field_types", {}) or {}
+        return self._visit_struct_literal_from_fields(
+            node, fname, list(fndef.declarations.keys()), field_types, fndef.declarations
+        )
 
+    def _visit_struct_literal_from_fields(
+        self,
+        node,
+        fname: str,
+        field_names: list[str],
+        field_types: dict[str, str],
+        fallback_types: dict[str, str] | None = None,
+    ) -> str:
+        vargs = []  # visited args
+        fallback_types = fallback_types or {}
         if node.args:
-            for arg_node, decl in zip(node.args, fndef.declarations.keys()):
+            for arg_node, decl in zip(node.args, field_names):
                 arg = self.visit(arg_node)
-                field_type = field_types.get(decl) or fndef.declarations.get(decl)
+                field_type = field_types.get(decl) or fallback_types.get(decl)
                 arg = self._wrap_todo_field_value(field_type, arg)
                 if decl in self._keywords:
                     decl = escape_rust_ident(decl)
@@ -578,7 +633,7 @@ class RustTranspiler(CLikeTranspiler):
                 value = self.visit(kw.value)
                 field_type = None
                 if kw.arg:
-                    field_type = field_types.get(kw.arg) or fndef.declarations.get(kw.arg)
+                    field_type = field_types.get(kw.arg) or fallback_types.get(kw.arg)
                 value = self._wrap_todo_field_value(field_type, value)
                 arg_name = escape_rust_ident(kw.arg) if kw.arg else kw.arg
                 vargs += [f"{arg_name}: {value}"]
@@ -596,6 +651,9 @@ class RustTranspiler(CLikeTranspiler):
 
         fname = self.visit(node.func)
         fndef = node.scopes.find(fname)
+
+        if fname == "LogCurrent" and not node.args and not node.keywords:
+            return "LogCurrent"
 
         if (
             isinstance(node.func, ast.Attribute)
@@ -645,12 +703,28 @@ class RustTranspiler(CLikeTranspiler):
                 for body_item in fndef.body
             )
             has_decls = hasattr(fndef, "declarations")
+            if has_decls and not has_new:
+                return self._visit_struct_literal(node, fname, fndef)
             if fname in CONSTRUCTOR_TYPES or has_new or not has_decls:
                 ctor = "::new" if has_new else ""
                 return f"{fname}{ctor}({', '.join(vargs)})"
-            return self._visit_struct_literal(node, fname, fndef)
+
+        if fname in CLASS_FIELD_TYPES:
+            return self._visit_struct_literal_from_fields(
+                node, fname, list(CLASS_FIELD_TYPES[fname].keys()), CLASS_FIELD_TYPES[fname]
+            )
 
         if fname == "isinstance" and len(vargs) >= 2:
+            if isinstance(node.args[1], ast.Tuple):
+                markers = []
+                for elt in node.args[1].elts:
+                    marker_name = get_id(elt)
+                    if marker_name in ION_TYPE_NAMES or marker_name in self.BUILTIN_INSTANCE_TAGS:
+                        markers.append(rust_string_literal(marker_name))
+                    else:
+                        markers.append(self.visit(elt))
+                self._usings.add("pylib::is_instance_ref")
+                return f"is_instance_ref(&{vargs[0]}, &({', '.join(markers)}))"
             type_arg = vargs[1].strip()
             if type_arg.startswith("&"):
                 type_arg = type_arg[1:]
@@ -770,6 +844,28 @@ class RustTranspiler(CLikeTranspiler):
         return f'b"{"".join(escaped)}"'
 
     def visit_Compare(self, node) -> str:
+        if (
+            isinstance(node.left, ast.Call)
+            and get_id(node.left.func) == "Some"
+            and node.left.args
+            and len(node.comparators) == 1
+            and isinstance(node.comparators[0], ast.Constant)
+            and node.comparators[0].value is None
+        ):
+            subject_node = node.left.args[0]
+            subject = self.visit(subject_node)
+            subject_type = self._expr_rust_type(subject_node)
+            if subject_type and subject_type.startswith("Option<"):
+                if isinstance(node.ops[0], (ast.NotEq, ast.IsNot)):
+                    return f"{subject}.is_some()"
+                if isinstance(node.ops[0], (ast.Eq, ast.Is)):
+                    return f"{subject}.is_none()"
+            is_none = f"matches!({subject}.clone(), TODO_py2many_unknown::Unit)"
+            if isinstance(node.ops[0], (ast.NotEq, ast.IsNot)):
+                return f"!{is_none}"
+            if isinstance(node.ops[0], (ast.Eq, ast.Is)):
+                return is_none
+
         left_expr = self.visit(node.left)
         if isinstance(node.left, ast.Call) and get_id(node.left.func) in {"type", "r#type"}:
             self._usings.add("pylib::python_type_eq")
@@ -788,7 +884,13 @@ class RustTranspiler(CLikeTranspiler):
                 return f"python_type_eq({type_call}, {right})"
 
         left = left_expr
-        right = self.visit(node.comparators[0])
+        comparator = node.comparators[0]
+        ion_type_compare = isinstance(comparator, ast.Name) and comparator.id in ION_TYPE_NAMES
+        right = (
+            self._visit_as_ion_type_value(comparator)
+            if ion_type_compare
+            else self.visit(comparator)
+        )
 
         if hasattr(node.comparators[0], "annotation"):
             self._generic_typename_from_annotation(node.comparators[0])
@@ -797,6 +899,12 @@ class RustTranspiler(CLikeTranspiler):
             )
             if value_type and value_type[0] == "Dict":
                 right += ".keys()"
+
+        if ion_type_compare:
+            if isinstance(node.ops[0], (ast.Eq, ast.Is)):
+                return f"{left} == {right}"
+            if isinstance(node.ops[0], (ast.NotEq, ast.IsNot)):
+                return f"{left} != {right}"
 
         cmpop = "contains"
         left = f"&{left}"
@@ -816,19 +924,38 @@ class RustTranspiler(CLikeTranspiler):
 
         return super().visit_Compare(node)
 
+    def _ion_type_value(self, name: str) -> str:
+        return f"IonDataType::{name}"
+
+    def _visit_as_ion_type_value(self, node) -> str:
+        self._ion_type_value_context += 1
+        try:
+            return self.visit(node)
+        finally:
+            self._ion_type_value_context -= 1
+
     def visit_Name(self, node) -> str:
         if node.id == "None":
             return "Option::<()>::None"
-        else:
-            ret = super().visit_Name(node)
-            definition = node.scopes.find(node.id)
-            if (
-                definition
-                and definition != node
-                and getattr(definition, "needs_dereference", False)
-            ):
-                return f"*{ret}"
-            return ret
+        if (
+            self._ion_type_value_context
+            and isinstance(node.ctx, ast.Load)
+            and node.id in ION_TYPE_NAMES
+        ):
+            return self._ion_type_value(node.id)
+        if self._class_static_context and isinstance(node.ctx, ast.Load):
+            class_name, const_names, method_names = self._class_static_context
+            if node.id in const_names or node.id in method_names:
+                return f"{class_name}::{escape_rust_ident(node.id)}"
+        ret = super().visit_Name(node)
+        definition = node.scopes.find(node.id)
+        if (
+            definition
+            and definition != node
+            and getattr(definition, "needs_dereference", False)
+        ):
+            return f"*{ret}"
+        return ret
 
     def visit_NameConstant(self, node) -> str:
         if node.value is True:
@@ -845,8 +972,12 @@ class RustTranspiler(CLikeTranspiler):
         orelse_vars = {get_id(v) for v in node.scopes[-1].orelse_vars}
         node.common_vars = body_vars.intersection(orelse_vars)
 
-        # TODO find out if this can be useful
         var_definitions = []
+        for var_name in sorted(node.common_vars):
+            definition = node.scopes.parent_scopes.find(var_name)
+            if definition is not None and defined_before(definition, node):
+                continue
+            var_definitions.append(f"let mut {escape_rust_ident(var_name)};\n")
         test_expr = self.visit(node.test)
         test_expr = self._rust_truthiness(node.test, test_expr)
         buf = []
@@ -1082,6 +1213,19 @@ class RustTranspiler(CLikeTranspiler):
         return f"enum {camel_node_name} {{ {body_str} }}\n\n impl {camel_node_name} {{ {impl_str} }}\n\n"
 
     KFX_CLASS_OVERRIDES = {
+        "LogCurrent": """\
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LogCurrent;
+
+impl LogCurrent {
+    pub fn debug<T: std::fmt::Display>(&self, _msg: T) {}
+    pub fn info<T: std::fmt::Display>(&self, _msg: T) {}
+    pub fn warn<T: std::fmt::Display>(&self, _msg: T) {}
+    pub fn warning<T: std::fmt::Display>(&self, _msg: T) {}
+    pub fn error<T: std::fmt::Display>(&self, _msg: T) {}
+    pub fn exception<T: std::fmt::Display>(&self, _msg: T) {}
+}
+""",
         "IonTimestamp": """\
 #[derive(Clone, Debug, Default)]
 pub struct IonTimestamp {
@@ -1224,15 +1368,19 @@ impl IonSymbol {
 
     @staticmethod
     def _wrap_todo_field_value(field_type: Optional[str], value_expr: str) -> str:
+        if value_expr in {"None", "Option::<()>::None"}:
+            return value_expr
+        if field_type == "String" and not value_expr.endswith(
+            (".to_string()", ".into()")
+        ):
+            return f"{value_expr}.to_string()"
+        if field_type == "Vec<String>" and value_expr.startswith("vec!["):
+            return f"{value_expr}.into_iter().map(|s| s.to_string()).collect()"
         is_todo = field_type is None or (
             field_type in {"_", "TODO_py2many_unknown"}
             or "TODO_py2many_unknown" in str(field_type)
         )
-        if (
-            is_todo
-            and value_expr not in {"None", "Option::<()>::None"}
-            and not value_expr.endswith(".into()")
-        ):
+        if is_todo and not value_expr.endswith(".into()"):
             return f"{value_expr}.into()"
         return value_expr
 
@@ -1244,7 +1392,34 @@ impl IonSymbol {
                 return True
         return False
 
+    @staticmethod
+    def _class_assignment_name(node) -> str | None:
+        if isinstance(node, ast.Assign) and node.targets:
+            return get_id(node.targets[0])
+        if isinstance(node, ast.AnnAssign):
+            return get_id(node.target)
+        return None
+
+    @staticmethod
+    def _class_assignment_needs_hoist(node) -> bool:
+        value = getattr(node, "value", None)
+        return isinstance(
+            value,
+            (
+                ast.Call,
+                ast.Dict,
+                ast.DictComp,
+                ast.GeneratorExp,
+                ast.List,
+                ast.ListComp,
+                ast.Set,
+                ast.SetComp,
+            ),
+        )
+
     def visit_ClassDef(self, node) -> str:
+        if node.name == "LogCurrent":
+            return self.KFX_CLASS_OVERRIDES["LogCurrent"]
         if node.name == "IonStruct" and self._ordered_dict_subclass(node):
             self._usings.add("indexmap::IndexMap")
             return self.KFX_CLASS_OVERRIDES["IonStruct"]
@@ -1307,15 +1482,44 @@ impl IonSymbol {
         )
         impl_extension = "#[pymethods]\n" if self.extension else ""
         impl_def = f"{impl_extension}impl {node.name} {{\n"
+        assignment_names = {
+            name
+            for name in (self._class_assignment_name(b) for b in node.body)
+            if name is not None
+        }
+        hoisted_names = {
+            name
+            for b in node.body
+            for name in [self._class_assignment_name(b)]
+            if name is not None and self._class_assignment_needs_hoist(b)
+        }
+        const_names = assignment_names - hoisted_names
+        method_names = {b.name for b in node.body if isinstance(b, ast.FunctionDef)}
+        if hoisted_names:
+            self._class_hoisted_assignments[node.name] = hoisted_names
+
+        hoisted_lines = []
         const_lines = []
         body_lines = []
         for b in node.body:
-            if isinstance(b, ast.Assign) and getattr(b, "class_assignment", False):
-                const_lines.append(self.visit(b))
+            if isinstance(b, (ast.Assign, ast.AnnAssign)):
+                name = self._class_assignment_name(b)
+                if name in hoisted_names:
+                    previous_context = self._class_static_context
+                    self._class_static_context = (node.name, const_names, method_names)
+                    try:
+                        hoisted_lines.append(self.visit(b))
+                    finally:
+                        self._class_static_context = previous_context
+                else:
+                    const_lines.append(self.visit(b))
             else:
                 body_lines.append(self.visit(b))
+        hoisted_str = "\n".join([line for line in hoisted_lines if line])
+        if hoisted_str:
+            hoisted_str += "\n"
         buf_str = "\n".join([line for line in const_lines + body_lines if line])
-        return f"{extension}{struct_def}{impl_def}{buf_str} \n}}"
+        return f"{hoisted_str}{extension}{struct_def}{impl_def}{buf_str} \n}}"
 
     def visit_IntEnum(self, node) -> str:
         fields = []
@@ -1413,7 +1617,12 @@ impl IonSymbol {
     def visit_List(self, node) -> str:
         self._usings.add("std::collections")
         if len(node.elts) > 0:
-            elements = [self.visit(e) for e in node.elts]
+            elements = [
+                self._visit_as_ion_type_value(e)
+                if isinstance(e, ast.Name) and e.id in ION_TYPE_NAMES
+                else self.visit(e)
+                for e in node.elts
+            ]
             return "vec![{}]".format(", ".join(elements))
 
         else:
@@ -1427,7 +1636,14 @@ impl IonSymbol {
             for i in range(len(node.keys)):
                 # we hit this case when using d1 = {..., **d2}
                 # The generated code isn't quite right, but it fixes a test error
-                key = self.visit(node.keys[i]) if node.keys[i] else "_"
+                key_node = node.keys[i]
+                key = (
+                    self._visit_as_ion_type_value(key_node)
+                    if isinstance(key_node, ast.Name) and key_node.id in ION_TYPE_NAMES
+                    else self.visit(key_node)
+                    if key_node
+                    else "_"
+                )
                 value = self.visit(node.values[i])
                 kv_string.append(f"({key}, {value})")
             initialization = "[{0}].iter().cloned().collect::<HashMap<_,_>>()"
@@ -1851,7 +2067,12 @@ impl IonSymbol {
         self._usings.add("std::collections::HashSet")
         elts = []
         for i in range(len(node.elts)):
-            elt = self.visit(node.elts[i])
+            elt_node = node.elts[i]
+            elt = (
+                self._visit_as_ion_type_value(elt_node)
+                if isinstance(elt_node, ast.Name) and elt_node.id in ION_TYPE_NAMES
+                else self.visit(elt_node)
+            )
             elts.append(elt)
 
         if elts:

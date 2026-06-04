@@ -5,7 +5,7 @@ from py2many.cli import _transpile
 from py2many.pyrs import settings as rust_settings
 
 
-def rust_transpile(source: str) -> str:
+def rust_transpile(source: str, filename: str = "case.py") -> str:
     args = Namespace(
         typpete=False,
         extension=False,
@@ -13,7 +13,7 @@ def rust_transpile(source: str) -> str:
         llm=False,
     )
     settings = rust_settings(args)
-    return _transpile([Path("case.py")], [source], settings, args)[0][0]
+    return _transpile([Path(filename)], [source], settings, args)[0][0]
 
 
 def test_class_method_locals_are_not_class_constants():
@@ -56,6 +56,91 @@ class Action:
     assert (
         "pub const minimum_calibre_version: (i32, i32, i32) = (5, 0, 0);" in generated
     )
+
+
+def test_complex_class_assignments_are_hoisted_out_of_impl_blocks():
+    generated = rust_transpile("""
+class Codec:
+    FLAG = 1
+    TABLE = {FLAG: "one"}
+
+    def read(self, key):
+        return Codec.TABLE[key]
+""")
+
+    assert "impl Codec {\n    lazy_static!" not in generated
+    assert "lazy_static! { pub static ref TABLE:" in generated
+    assert 'Codec::FLAG, "one"' in generated
+    assert "return TABLE[key];" in generated
+
+
+def test_hoisted_class_assignments_qualify_class_methods():
+    generated = rust_transpile("""
+class Codec:
+    FLAG = 1
+    HANDLERS = {FLAG: read_flag}
+
+    def read_flag(self):
+        return Codec.FLAG
+""")
+
+    assert "impl Codec {\n    lazy_static!" not in generated
+    assert "Codec::read_flag" in generated
+
+
+def test_kfx_constructor_type_with_declarations_uses_struct_literal():
+    generated = rust_transpile("""
+class IonSharedSymbolTable(object):
+    def __init__(self, name, version, symbols):
+        self.name = name
+        self.version = version
+        self.symbols = symbols
+
+SYSTEM_SYMBOL_TABLE = IonSharedSymbolTable(name="$ion", version=1, symbols=["$ion"])
+""")
+
+    assert "IonSharedSymbolTable(" not in generated
+    assert "IonSharedSymbolTable{name:" in generated
+
+
+def test_known_kfx_constructor_type_uses_field_map_struct_literal():
+    generated = rust_transpile(
+        'SYSTEM_SYMBOL_TABLE = IonSharedSymbolTable("$ion", 1, ["$ion"])\n'
+    )
+
+    assert "IonSharedSymbolTable(" not in generated
+    assert "IonSharedSymbolTable{name:" in generated
+    assert 'name: "$ion".to_string()' in generated
+    assert "version: 1" in generated
+    assert "symbols: vec!" in generated
+    assert ".into_iter().map(|s| s.to_string()).collect()" in generated
+
+
+def test_unknown_none_comparison_uses_todo_unit_match():
+    generated = rust_transpile("""
+def set_logger(logger):
+    if logger is not None:
+        return logger
+    return None
+""")
+
+    assert "!matches!(logger.clone(), TODO_py2many_unknown::Unit)" in generated
+    assert "Some(logger) != Option::<()>::None" not in generated
+
+
+def test_if_else_assigned_locals_are_declared_before_branch():
+    generated = rust_transpile("""
+def choose(cond):
+    if cond:
+        value = 1
+    else:
+        value = 2
+    return value
+""")
+
+    assert "let mut value;\nif cond" in generated
+    assert "value = 1;" in generated
+    assert "value = 2;" in generated
 
 
 def test_module_level_subscript_assignment_is_wrapped_in_init_function():
@@ -364,7 +449,67 @@ def read_value(value):
 """)
 
     assert "let data_type: IonDataType = ion_type(value);" in generated
+    assert "data_type == IonDataType::IonSExp" in generated
     assert "let item: IonValue = value.pop();" in generated
+
+
+def test_ion_module_emits_ion_data_type_enum():
+    generated = rust_transpile("IonBool = bool\n", filename="ion.py")
+
+    assert "pub enum IonDataType" in generated
+    assert "IonAnnotation," in generated
+    assert "IonNull," in generated
+
+
+def test_message_log_current_override_has_logging_methods():
+    generated = rust_transpile("""
+class LogCurrent(object):
+    def __getattr__(self, method_name):
+        return getattr(get_current_logger(), method_name)
+
+log = LogCurrent()
+""")
+
+    assert "pub struct LogCurrent" in generated
+    assert "pub fn error" in generated
+    assert "pub const log: LogCurrent = LogCurrent;" in generated
+
+
+def test_imported_log_object_uses_method_call_syntax():
+    generated = rust_transpile("""
+from .message_logging import log
+
+def write_log():
+    log.error("x")
+""")
+
+    assert 'log.error("x")' in generated
+    assert "log::error" not in generated
+
+
+def test_isinstance_tuple_uses_string_type_markers_for_ion_types():
+    generated = rust_transpile("""
+def check(value):
+    return isinstance(value, (IonBLOB, bytes))
+""")
+
+    assert 'is_instance_ref(&value, &("IonBLOB", "bytes"))' in generated
+
+
+def test_ion_type_names_emit_enum_values_in_value_contexts():
+    generated = rust_transpile("""
+def get_type(value):
+    if ion_type(value) == IonAnnotation:
+        return IonAnnotation
+    types = {IonAnnotation, IonList}
+    handlers = {IonList: handle_list}
+    return IonNull
+""")
+
+    assert "ion_type(value) == IonDataType::IonAnnotation" in generated
+    assert "return IonDataType::IonAnnotation;" in generated
+    assert "IonDataType::IonList" in generated
+    assert "return IonDataType::IonNull;" in generated
 
 
 def test_kfx_ion_type_membership_narrows_source_value():
