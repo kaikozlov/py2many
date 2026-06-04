@@ -75,6 +75,10 @@ METHOD_RETURNS = {
     ("IonBinary", "deserialize_multiple_values"): "Vec<IonValue>",
     ("Token", "classify"): "String",
     ("Token", "__repr__"): "String",
+    ("IonTextFile", "current_token"): "Token",
+    ("IonTextFile", "peek_token"): "Token",
+    ("IonTextFile", "next_token"): "Token",
+    ("IonTextFile", "get_next_token"): "Token",
     ("KfxContainerEntity", "deserialize"): "YJFragment",
     ("LocalSymbolTable", "create_import"): "Option<IonAnnotation>",
     ("LocalSymbolTable", "create_local_symbol"): "IonSymbol",
@@ -121,6 +125,10 @@ METHOD_NAME_RETURNS = {
     "get_symbol": "IonSymbol",
     "items": "Vec<(IonSymbol, IonValue)>",
     "values": "Vec<IonValue>",
+    "current_token": "Token",
+    "peek_token": "Token",
+    "next_token": "Token",
+    "get_next_token": "Token",
 }
 
 FREE_FUNCTION_RETURNS = {
@@ -257,6 +265,10 @@ CLASS_FIELD_TYPES = {
         "file": "Option<TODO_py2many_unknown>",
         "allow_operators": "i32",
         "allow_unicode_strings": "bool",
+    },
+    "IonBinary": {
+        "symtab": "Option<LocalSymbolTable>",
+        "import_symbols": "TODO_py2many_unknown",
     },
     "IonTimestampTZ": {
         "__offset": "Option<i32>",

@@ -258,6 +258,8 @@ class RustTranspilerPlugins:
                 return "0"
             elif cast_to == "f64":
                 return "0.0"
+        if cast_to == "i32":
+            return f"{vargs[0]}.as_i32()"
         return f"{vargs[0]} as {cast_to}"
 
     @staticmethod

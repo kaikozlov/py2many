@@ -116,9 +116,77 @@ def test_known_kfx_constructor_type_uses_field_map_struct_literal():
     assert ".into_iter().map(|s| s.to_string()).collect()" in generated
 
 
+def test_kfx_field_facts_add_struct_fields_not_assigned_directly():
+    generated = rust_transpile("""
+class IonText(IonSerial):
+    def __init__(self):
+        self.indent = 0
+""")
+
+    assert "pub symtab: Option<LocalSymbolTable>," in generated
+    assert "pub indent: i32," in generated
+
+
+def test_string_return_into_unknown_is_wrapped():
+    generated = rust_transpile("""
+def render(value):
+    return repr(value)
+""")
+
+    assert "return repr(value).into();" in generated
+
+
+def test_peek_char_default_offset_is_emitted():
+    generated = rust_transpile("""
+def skip(file):
+    return file.peek_char()
+""")
+
+    assert "file.peek_char(0.into())" in generated
+
+
+def test_i32_cast_uses_todo_numeric_helper():
+    generated = rust_transpile("""
+def read(flag):
+    return int(flag)
+""")
+
+    assert "flag.as_i32()" in generated
+    assert "flag as i32" not in generated
+
+
+def test_kfx_token_parameters_are_typed_as_token():
+    generated = rust_transpile("""
+def read_token(token):
+    return token.text
+""")
+
+    assert "pub fn read_token(token: Token)" in generated
+
+
+def test_ion_text_file_token_methods_return_token_type():
+    generated = rust_transpile("""
+def read(file):
+    token = file.current_token()
+    return token.text
+""")
+
+    assert "let token: Token = file.current_token();" in generated
+
+
+def test_raise_emits_panic_expression_for_non_result_functions():
+    generated = rust_transpile("""
+def fail():
+    raise Exception("bad")
+""")
+
+    assert 'return panic!("raised exception");' in generated
+    assert "return Err(" not in generated
+
+
 def test_unknown_none_comparison_uses_todo_unit_match():
     generated = rust_transpile("""
-def set_logger(logger):
+def check_logger(logger):
     if logger is not None:
         return logger
     return None
@@ -181,7 +249,7 @@ def describe(name, count):
     return f"{name} has {count} books"
 """)
 
-    assert 'return format!("{} has {} books", name, count);' in generated
+    assert 'return format!("{} has {} books", name, count).into();' in generated
 
 
 def test_try_except_preserves_handler_body_without_unsupported_marker():
@@ -198,7 +266,7 @@ def load(log):
     assert "log.error(err);" in generated
 
 
-def test_raise_emits_err_without_unsupported_marker():
+def test_raise_emits_panic_without_unsupported_marker():
     generated = rust_transpile("""
 def load():
     raise Exception("bad")
@@ -206,7 +274,7 @@ def load():
 
     assert "raise!(" not in generated
     assert "//unsupported" not in generated
-    assert 'return Err(Exception("bad").into());' in generated
+    assert 'return panic!("raised exception");' in generated
 
 
 def test_isinstance_uses_rust_helper_not_python_builtin():
@@ -406,7 +474,7 @@ def read_values(symtab, data):
     return values
 """)
 
-    assert "let binary: IonBinary = IonBinary(symtab);" in generated
+    assert "let binary: IonBinary = IonBinary{symtab: symtab};" in generated
     assert "let value: IonValue = binary.deserialize_single_value(data);" in generated
     assert (
         "let annotated: IonAnnotation = binary.deserialize_annotated_value(data);"
